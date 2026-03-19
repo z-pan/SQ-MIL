@@ -1,0 +1,14 @@
+slide_id,label
+# Replace this file with your actual labels.csv
+# Columns:
+#   slide_id : string matching the filename stem of the .tif WSI (no extension)
+#   label    : integer 0-4
+#              0 = CC (Clear Cell)
+#              1 = EC (Endometrioid)
+#              2 = HGSC (High-Grade Serous)
+#              3 = LGSC (Low-Grade Serous)
+#              4 = MC (Mucinous)
+#
+# Example rows:
+# patient001_slide01,2
+# patient002_slide01,0
