@@ -30,7 +30,7 @@ from torch.utils.tensorboard import SummaryWriter
 from ..models.smmile import SMMILe
 from ..datasets.mil_dataset import MILDataset
 from .losses import SMMILeTotalLoss
-from .evaluator import Evaluator, EvalResult, summarize_folds
+from .evaluator import Evaluator, EvalResult
 
 logger = logging.getLogger(__name__)
 
