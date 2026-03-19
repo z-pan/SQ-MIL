@@ -249,8 +249,8 @@ def main() -> None:
             sub = df[df["slide_id"].isin(ids)]
             counts = sub["label_int"].value_counts().sort_index()
             return "  ".join(
-                f"{inv_map.get(int(l), str(l))}:{int(c)}"
-                for l, c in counts.items()
+                f"{inv_map.get(int(lbl), str(lbl))}:{int(cnt)}"
+                for lbl, cnt in counts.items()
             )
 
         logger.info(

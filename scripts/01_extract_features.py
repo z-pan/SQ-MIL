@@ -41,6 +41,8 @@ import logging
 import sys
 from pathlib import Path
 
+import numpy as np
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -114,7 +116,6 @@ def parse_args() -> argparse.Namespace:
 
 def _load_resnet50(device: str):
     """ResNet-50 truncated at layer3 + global average pool → 1024-dim."""
-    import torch
     import torch.nn as nn
     import torchvision.models as tvm
     import torchvision.transforms as T
@@ -168,7 +169,6 @@ def load_encoder(encoder_name: str, device: str):
 
     The model is frozen (no gradients) and moved to *device*.
     """
-    import torch
 
     if encoder_name == "resnet50":
         model, transform, dim = _load_resnet50(device)
@@ -191,7 +191,6 @@ def load_encoder(encoder_name: str, device: str):
 def _encode_batch(model, patch_tensors, device: str) -> "np.ndarray":
     """Run one batch through the encoder and return float32 numpy array."""
     import torch
-    import numpy as np
 
     batch = torch.stack(patch_tensors).to(device)
     with torch.no_grad():

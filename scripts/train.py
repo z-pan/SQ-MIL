@@ -48,8 +48,8 @@ from torch.utils.data import DataLoader
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.training.trainer import SMMILeTrainer
-from src.datasets.mil_dataset import build_dataset, load_labels, load_split_ids
+from src.training.trainer import SMMILeTrainer  # noqa: E402
+from src.datasets.mil_dataset import build_dataset  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
