@@ -260,29 +260,27 @@ class SMMILe(nn.Module):
         Stage 1 (always present)
         ~~~~~~~~~~~~~~~~~~~~~~~~
         ``bag_logits`` : (n_classes,)
-            Bag-level classification logits (input to ClsLoss).
+            Main bag-level logits: InS+InD at train, full-bag/drop at eval.
             Eq. (12)–(13): y_c = W_c^T M_c, where M_c = ∑_k a_{c,k} h_k.
-
+        ``bag_logits_raw`` : (n_classes,)
+            Variant 1 — full bag, no InD.
+        ``bag_logits_drop`` : (n_classes,)
+            Variant 2 — full bag, with per-category InD.
+        ``bag_logits_sampled`` : (n_classes,)
+            Variant 3 — InS pseudo-bag, no InD (= raw at eval).
         ``bag_prediction`` : (n_classes,)
-            Alias for ``bag_logits`` (task-spec naming).
-
-        ``attn_raw`` : (n_classes, K_bag)
-            Raw attention logits (pre-softmax) from GatedAttention.
-            K_bag = N_sp when InS is active (training), K otherwise.
-
-        ``attn`` : (n_classes, K_bag)
-            Softmax attention weights (input to RefLoss via Trainer).
-
+            Alias for ``bag_logits``.
+        ``attn`` : (n_classes, K)
+            Full-bag softmax attention weights.  **Always (C, K)** — never
+            the pseudo-bag shape — so RefLoss can safely index ref_logits.
+        ``attn_raw`` : (n_classes, K)
+            Full-bag raw attention logits (pre-softmax).
         ``inst_features`` : (K, D_nic)
-            Full-bag NIC features for ALL K instances (used in Stage 2
-            refinement and for heatmap generation).
-
+            Full-bag NIC features for all K instances.
         ``inst_scores`` : (K, n_classes)
-            Per-instance classification logits from ``instance_classifier``
-            applied to the full-bag features (not attention-pooled).
-            Eq. (10): f_c(h_k) for each instance k.
-
-        ``attention_scores`` : (n_classes, K_bag)
+            Per-instance classification logits (not attention-pooled).
+            Used for heatmap generation and spatial evaluation.
+        ``attention_scores`` : (n_classes, K)
             Alias for ``attn``.
 
         Stage 2 (present only when ``self.refinement is not None``)
@@ -305,68 +303,88 @@ class SMMILe(nn.Module):
         h = self.nic(x)   # full-bag NIC features, used throughout
 
         # ----------------------------------------------------------
-        # 2. Delocalized Instance Sampling (InS, §3.2, Eq. 7–9)
-        #    Active during training when superpixels are provided.
-        #    Produces a pseudo-bag h_bag from which attention is computed.
+        # 2. Full-bag attention — ALWAYS computed over all K instances.
+        #    This is the canonical attention used by:
+        #      • RefLoss (pseudo-label selection over K instances)
+        #      • ConsistencyLoss (uniform attention for normal bags)
+        #      • Heatmap generation (attention weights per patch)
+        #    A_raw_full, A_full : (n_classes, K)
         # ----------------------------------------------------------
+        A_raw_full, A_full = self.attention(h)  # (C, K)
+
+        # ----------------------------------------------------------
+        # 3. Four bag-prediction variants (Eq. 14 in SMMILe).
+        #    The ClassificationLoss averages BCE over all four to
+        #    encourage robust predictions under different regularisations.
+        #
+        #    variant 1 — raw:              full bag, no InD
+        #    variant 2 — drop:             full bag, with InD
+        #    variant 3 — sampled:          InS pseudo-bag, no InD
+        #    variant 4 — drop+sampled:     InS pseudo-bag, with InD  ← bag_logits
+        #
+        #    At eval / when InS is off, variants 3 and 4 collapse to
+        #    variants 1 and 2 respectively (h_bag = h, no stochasticity).
+        # ----------------------------------------------------------
+
+        # --- Variant 1: raw (full bag, no InD)
+        M_raw = torch.mm(A_full, h)                           # (C, D_nic)
+        bag_logits_raw = self.instance_classifier(M_raw).diagonal()  # (C,)
+
+        # --- Variant 2: drop (full bag, with InD)
+        A_drop_full = self._instance_dropout(A_raw_full, A_full)  # (C, K)
+        M_drop = torch.mm(A_drop_full, h)
+        bag_logits_drop = self.instance_classifier(M_drop).diagonal()  # (C,)
+
+        # --- Variants 3 & 4: InS pseudo-bag (training only)
         if self.training and self.ins_enabled and superpixels is not None:
-            h_bag, _ = self._instance_sampling(h, superpixels)  # (N_sp, D_nic)
+            h_bag, _ = self._instance_sampling(h, superpixels)   # (N_sp, D_nic)
+            A_raw_bag, A_bag = self.attention(h_bag)              # (C, N_sp)
+
+            # Variant 3: sampled, no InD
+            M_sampled = torch.mm(A_bag, h_bag)
+            bag_logits_sampled = self.instance_classifier(M_sampled).diagonal()
+
+            # Variant 4: sampled + InD  ← primary prediction at train time
+            A_drop_bag = self._instance_dropout(A_raw_bag, A_bag)
+            M_drop_bag = torch.mm(A_drop_bag, h_bag)
+            bag_logits = self.instance_classifier(M_drop_bag).diagonal()
         else:
-            h_bag = h  # (K, D_nic)  — full bag at inference
+            # At eval / InS disabled: variants 3 & 4 = variants 1 & 2
+            bag_logits_sampled = bag_logits_raw
+            bag_logits         = bag_logits_drop
 
         # ----------------------------------------------------------
-        # 3. Gated attention on h_bag   (§3.2, Eq. 10–11)
-        #    A_raw, A : (n_classes, K_bag)
+        # 4. Per-instance classification logits (for heatmaps & eval)
         # ----------------------------------------------------------
-        A_raw, A = self.attention(h_bag)
-
-        # ----------------------------------------------------------
-        # 4. Instance Dropout (InD, §3.2, Eq. 4–6)
-        #    Per-category masking of top-scoring instances.
-        # ----------------------------------------------------------
-        A_drop = self._instance_dropout(A_raw, A)  # (n_classes, K_bag)
-
-        # ----------------------------------------------------------
-        # 5. Bag aggregation (§3.2, Eq. 12)
-        #    M_c = ∑_k a_{c,k} h_k   →   M : (n_classes, D_nic)
-        # ----------------------------------------------------------
-        M = torch.mm(A_drop, h_bag)  # (n_classes, D_nic)
-
-        # ----------------------------------------------------------
-        # 6. Bag-level logits (§3.2, Eq. 13)
-        #    y_c = W_c^T M_c   — the diagonal trick:
-        #      instance_classifier: Linear(D_nic, n_classes)
-        #      instance_classifier(M) : (n_classes, n_classes)
-        #                              where [i,j] = W[j] · M[i]
-        #      diagonal [c,c] = W[c] · M[c]  ✓  (c-th classifier × c-th bag repr.)
-        # ----------------------------------------------------------
-        bag_logits = self.instance_classifier(M).diagonal()  # (n_classes,)
-
-        # Per-instance classification scores from the same linear layer
-        # applied to ALL K instances (not attention-pooled).
-        # Used for spatial heatmap generation and evaluation.
         inst_scores = self.instance_classifier(h)  # (K, n_classes)
 
         out: dict = {
-            # Primary outputs (trainer-compatible naming)
-            "bag_logits":        bag_logits,           # (n_classes,)
-            "attn_raw":          A_raw,                # (n_classes, K_bag)
-            "attn":              A,                    # (n_classes, K_bag) — post-InD re-norm
-            "inst_features":     h,                    # (K, D_nic)
-            "inst_scores":       inst_scores,          # (K, n_classes)
-            # Task-spec aliases
-            "bag_prediction":    bag_logits,
-            "attention_scores":  A,
+            # ---- Four bag prediction variants for ClassificationLoss ----
+            "bag_logits":          bag_logits,          # (C,) main (InS+InD / drop at eval)
+            "bag_logits_raw":      bag_logits_raw,      # (C,) full bag, no InD
+            "bag_logits_drop":     bag_logits_drop,     # (C,) full bag, with InD
+            "bag_logits_sampled":  bag_logits_sampled,  # (C,) pseudo-bag, no InD
+            # ---- Full-bag attention — ALWAYS (C, K) ----
+            # Invariant: out["attn"] is always over the full K instances so that
+            # RefLoss can correctly index ref_logits[K, C+1] by patch position.
+            "attn":                A_full,              # (C, K) normalised
+            "attn_raw":            A_raw_full,          # (C, K) raw logits
+            # ---- Features ----
+            "inst_features":       h,                   # (K, D_nic)
+            "inst_scores":         inst_scores,         # (K, C)
+            # ---- Aliases (task-spec naming) ----
+            "bag_prediction":      bag_logits,
+            "attention_scores":    A_full,
         }
 
         # ----------------------------------------------------------
-        # 7. Stage 2 — instance refinement (§3.3, Eq. 14–16)
+        # 5. Stage 2 — instance refinement (§3.3, Eq. 14–16)
         #    Applied to full-bag features h (all K instances).
         # ----------------------------------------------------------
         if self.refinement is not None:
             ref_all: list[torch.Tensor] = self.refinement(h)  # N × (K, C+1)
-            out["ref_logits"]              = ref_all[-1]  # last layer (for Trainer)
-            out["ref_all_logits"]          = ref_all      # all layers
-            out["refinement_predictions"]  = ref_all      # task-spec alias
+            out["ref_logits"]             = ref_all[-1]   # last layer (Trainer compat)
+            out["ref_all_logits"]         = ref_all       # all N layers
+            out["refinement_predictions"] = ref_all       # task-spec alias
 
         return out
