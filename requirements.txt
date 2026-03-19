@@ -1,0 +1,50 @@
+# SQ-MIL dependencies
+# ------------------------------------------------------------
+# PyTorch: Install separately BEFORE this file to match your CUDA version.
+# See https://pytorch.org/get-started/locally/
+#
+# CUDA 11.8:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# CUDA 12.1:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# CUDA 12.4+: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# CPU only:   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+# Minimum: torch>=1.12, torchvision>=0.13
+# ------------------------------------------------------------
+
+# Core scientific stack
+numpy>=1.23
+pandas>=1.5
+scipy>=1.9
+
+# Image processing
+Pillow>=9.0
+opencv-python>=4.6
+tifffile>=2022.10
+openslide-python>=1.2
+
+# Scikit ecosystem
+scikit-image>=0.19
+scikit-learn>=1.1
+
+# Deep learning utilities
+timm>=0.9           # For Conch encoder backbone
+transformers>=4.30  # HuggingFace transformers (Conch tokenizer)
+huggingface_hub>=0.16
+
+# Data / storage
+h5py>=3.7
+
+# Visualization
+matplotlib>=3.6
+seaborn>=0.12
+
+# Training utilities
+tqdm>=4.64
+pyyaml>=6.0
+tensorboard>=2.11
+
+# Experiment tracking (optional, comment out if not needed)
+# wandb>=0.15
+
+# Reproducibility
+# Note: exact versions are intentionally not pinned for CUDA/OS portability.

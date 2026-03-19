@@ -1,0 +1,39 @@
+# Data and results (large files, not tracked)
+data/wsi/
+data/embeddings/
+data/superpixels/
+data/splits/
+data/labels.csv
+results/
+!results/.gitkeep
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TensorBoard logs
+tensorboard/
+runs/

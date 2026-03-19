@@ -1,0 +1,131 @@
+# =============================================================================
+# SQ-MIL — Stage 2 Training Configuration
+# Encoder: Conch (pathology foundation model, 512-dim)
+# Task: Ovarian cancer 5-subtype classification (UBC-OCEAN)
+#
+# Stage 2 loads Stage 1 checkpoint and adds:
+#   - N=3 instance refinement linear layers
+#   - Progressive pseudo-labeling (top-θ%)
+#   - Superpatch-based MRF smoothness constraint
+# =============================================================================
+
+# ------------------------------------------------------------------
+# Experiment identity
+# ------------------------------------------------------------------
+experiment:
+  name: ovarian_conch_s2
+  description: "SMMILe Stage 2 — Conch encoder, ovarian 5-subtype, MRF + refinement"
+  seed: 42
+
+# ------------------------------------------------------------------
+# Paths  (override via CLI: --data_root /path/to/data)
+# ------------------------------------------------------------------
+paths:
+  data_root: data
+  embedding_dir: data/embeddings
+  superpixel_dir: data/superpixels
+  split_dir: data/splits
+  labels_csv: data/labels.csv
+  # Stage 1 checkpoint to load (override with --stage1_ckpt)
+  stage1_ckpt: results/stage1/fold{fold}/best_model.pth
+  output_dir: results/stage2           # Checkpoints + logs + _inst.csv results
+
+# ------------------------------------------------------------------
+# Dataset / cross-validation
+# ------------------------------------------------------------------
+dataset:
+  n_folds: 5
+  fold: 0                              # Override with --fold N
+  val_ratio: 0.10
+
+# ------------------------------------------------------------------
+# Model architecture
+# Mirrors Stage 1 — do not change unless Stage 1 config was changed.
+# ------------------------------------------------------------------
+model:
+  encoder: conch
+  embedding_dim: 512
+  n_classes: 5
+  nic:
+    kernel_size: 3
+    out_channels: 256
+  attention:
+    hidden_dim: 256
+    dropout: true
+    dropout_rate: 0.25
+  instance_dropout:
+    enabled: true
+    drop_rate: 0.5
+  instance_sampling:
+    enabled: true
+    n_pseudobags: 5
+  # Instance refinement (Stage 2 specific)
+  refinement:
+    n_layers: 3                        # Number of refinement linear layers (N)
+    hidden_dim: 256
+
+# ------------------------------------------------------------------
+# Training — Stage 2
+# ------------------------------------------------------------------
+training:
+  stage: 2
+  epochs: 20                           # 20 for Conch; use 100 for ResNet-50
+  batch_size: 1
+  optimizer:
+    name: adam
+    lr: 2.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+  scheduler:
+    name: cosine
+    min_lr: 1.0e-7
+  early_stopping:
+    enabled: true
+    patience: 7
+    monitor: val_loss
+  weighted_sampling: true
+
+# ------------------------------------------------------------------
+# Loss functions (Stage 2)
+# ------------------------------------------------------------------
+loss:
+  cls_weight: 1.0                      # Weight for L_cls
+  ref_weight: 1.0                      # Weight for L_ref (instance refinement)
+  mrf_weight: 1.0                      # Weight for L_mrf (MRF smoothness)
+  # MRF hyperparameters
+  mrf:
+    lambda1: 0.8                       # Spatial smoothness term weight
+    lambda2: 0.2                       # Unary term weight
+  # Progressive pseudo-labeling
+  pseudo_label:
+    theta: 0.10                        # Top-θ% instances selected per category
+  # L_cons not used for UBC-OCEAN (no explicit normal class)
+  consistency: false
+  cons_weight: 0.0
+
+# ------------------------------------------------------------------
+# Inference / evaluation (run at end of each epoch on val set)
+# ------------------------------------------------------------------
+inference:
+  # Output columns in _inst.csv: filename, x, y, predicted_class, prob_CC, prob_EC,
+  #                               prob_HGSC, prob_LGSC, prob_MC
+  save_inst_csv: true
+  # Softmax temperature for instance predictions (1.0 = standard softmax)
+  temperature: 1.0
+
+# ------------------------------------------------------------------
+# Logging & checkpointing
+# ------------------------------------------------------------------
+logging:
+  log_every_n_steps: 10
+  save_top_k: 1
+  save_last: true
+  tensorboard: true
+
+# ------------------------------------------------------------------
+# Hardware
+# ------------------------------------------------------------------
+hardware:
+  num_workers: 4
+  pin_memory: true
+  gpu_id: 0
