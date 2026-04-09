@@ -105,6 +105,11 @@ def apply_overrides(cfg: dict, args: argparse.Namespace) -> dict:
         paths["superpixel_dir"]  = str(Path(args.data_root) / "superpixels")
         paths["split_dir"]       = str(Path(args.data_root) / "splits")
         paths["labels_csv"]      = str(Path(args.data_root) / "labels.csv")
+    # Fine-grained overrides (take precedence over data_root-derived paths)
+    if args.emb_dir:
+        paths["embedding_dir"]  = args.emb_dir
+    if args.sp_dir:
+        paths["superpixel_dir"] = args.sp_dir
     if args.output_dir:
         paths["output_dir"] = args.output_dir
     if args.gpu_id is not None:
@@ -229,6 +234,12 @@ def parse_args() -> argparse.Namespace:
     # Config overrides
     p.add_argument("--data_root",   default=None,
                    help="Override paths.data_root (all sub-paths inferred).")
+    p.add_argument("--emb_dir",     default=None,
+                   help="Override paths.embedding_dir directly "
+                        "(use when embeddings are not under data_root/embeddings).")
+    p.add_argument("--sp_dir",      default=None,
+                   help="Override paths.superpixel_dir directly "
+                        "(use when superpixels are not under data_root/superpixels).")
     p.add_argument("--output_dir",  default=None,
                    help="Override paths.output_dir.")
     p.add_argument("--gpu_id",      type=int, default=None,

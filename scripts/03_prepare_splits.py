@@ -161,7 +161,16 @@ def main() -> None:
 
     # ------------------------------------------------------------------ load
     df = pd.read_csv(args.labels)
-    df["slide_id"] = df["slide_id"].astype(str).str.strip()
+    # Normalize slide IDs: '11417.0' (pandas float round-trip) → '11417'
+    def _norm(s: str) -> str:
+        try:
+            f = float(s)
+            if f == int(f):
+                return str(int(f))
+        except (ValueError, OverflowError):
+            pass
+        return s
+    df["slide_id"] = df["slide_id"].astype(str).str.strip().apply(_norm)
 
     # Validate and encode labels
     try:
