@@ -146,6 +146,57 @@ def probe_npy(path: Path) -> tuple[tuple[int, ...], str]:
     return arr.shape, str(arr.dtype)
 
 
+def inspect_object_npy(path: Path) -> str:
+    """Load an object-dtype .npy file and return a human-readable description."""
+    arr = np.load(str(path), allow_pickle=True)
+    obj = arr.item() if arr.shape == () else arr
+
+    lines = [f"File: {path.name}", f"  numpy shape : {arr.shape}", f"  numpy dtype : {arr.dtype}"]
+
+    if isinstance(obj, dict):
+        lines.append(f"  Python type : dict  ({len(obj)} keys)")
+        for key, val in obj.items():
+            if isinstance(val, np.ndarray):
+                lines.append(f"    [{key!r}]  ndarray  shape={val.shape}  dtype={val.dtype}")
+            else:
+                lines.append(f"    [{key!r}]  {type(val).__name__}  value={val!r}"[:120])
+    elif isinstance(obj, np.ndarray):
+        lines.append(f"  Python type : ndarray  shape={obj.shape}  dtype={obj.dtype}")
+    else:
+        lines.append(f"  Python type : {type(obj).__name__}")
+        lines.append(f"  repr        : {repr(obj)[:200]}")
+
+    return "\n".join(lines)
+
+
+def extract_array_from_object(obj_npy: Path, preferred_keys: list[str]) -> np.ndarray:
+    """Load an object-dtype .npy file and extract the embedded array.
+
+    Tries *preferred_keys* in order if the object is a dict.
+    Falls back to the first ndarray value found in the dict.
+    """
+    arr = np.load(str(obj_npy), allow_pickle=True)
+    obj = arr.item() if arr.shape == () else arr
+
+    if isinstance(obj, np.ndarray):
+        return obj
+
+    if isinstance(obj, dict):
+        # Try preferred keys first
+        for key in preferred_keys:
+            if key in obj and isinstance(obj[key], np.ndarray):
+                return obj[key]
+        # Fall back: first ndarray value
+        for val in obj.values():
+            if isinstance(val, np.ndarray):
+                return val
+        raise ValueError(
+            f"No ndarray found in dict keys {list(obj.keys())} in {obj_npy.name}"
+        )
+
+    raise ValueError(f"Cannot extract array from {type(obj).__name__} in {obj_npy.name}")
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -199,17 +250,21 @@ def validate(
         sample_sid = next(iter(emb_map))
         sample_files = sorted(emb_map[sample_sid])
         probe_shape, probe_dtype = probe_npy(sample_files[0])
-        emb_is_matrix = len(probe_shape) == 2   # (N, D) = all patches in one file
+        emb_is_object = (probe_dtype == "object")
+        emb_is_matrix = (not emb_is_object) and len(probe_shape) == 2
         emb_info = (
             f"flat layout  |  {len(emb_ids)} unique slide_ids  |  "
             f"example file: {sample_files[0].name}  |  "
             f"shape={probe_shape} dtype={probe_dtype}"
         )
+        if emb_is_object:
+            emb_info += "  ⚠ object dtype — run with --inspect to see internal structure"
     elif emb_layout == "structured":
         emb_struct = scan_structured_dir(emb_dir)
         emb_ids = set(emb_struct.keys())
-        emb_map = {}          # not used for structured
+        emb_map = {}
         emb_is_matrix = False
+        emb_is_object = False
         sample_sid = next(iter(emb_struct))
         sub = emb_struct[sample_sid]
         has_coords = (sub / "coords.csv").exists()
@@ -228,15 +283,19 @@ def validate(
         sp_ids = set(sp_map.keys())
         sample_sp_sid = next(iter(sp_map))
         sp_shape, sp_dtype = probe_npy(sp_map[sample_sp_sid][0])
+        sp_is_object = (sp_dtype == "object")
         sp_info = (
             f"flat layout  |  {len(sp_ids)} unique slide_ids  |  "
             f"example file: {sp_map[sample_sp_sid][0].name}  |  "
             f"shape={sp_shape} dtype={sp_dtype}"
         )
+        if sp_is_object:
+            sp_info += "  ⚠ object dtype — run with --inspect to see internal structure"
     elif sp_layout == "structured":
         # Structured superpixel dir: {slide_id}.npy files
         sp_ids = {p.stem for p in sp_dir.glob("*.npy")}
         sp_map = {}
+        sp_is_object = False
         sample_sp_sid = next(iter(sp_ids))
         sp_shape, sp_dtype = probe_npy(sp_dir / f"{sample_sp_sid}.npy")
         sp_info = (
@@ -258,22 +317,28 @@ def validate(
     aligned_ids         = sorted(label_ids & emb_ids & (sp_ids if sp_ids else label_ids))
 
     report = {
-        "label_count":       len(label_ids),
+        "label_count":        len(label_ids),
         "label_distribution": label_dist,
-        "emb_count":         len(emb_ids),
-        "sp_count":          len(sp_ids),
-        "emb_layout":        emb_layout,
-        "sp_layout":         sp_layout,
-        "emb_info":          emb_info,
-        "sp_info":           sp_info,
-        "emb_is_matrix":     emb_is_matrix if emb_layout == "flat" else False,
-        "in_labels_no_emb":  sorted(in_labels_no_emb),
-        "in_labels_no_sp":   sorted(in_labels_no_sp),
-        "in_emb_no_labels":  sorted(in_emb_no_labels),
-        "in_sp_no_labels":   sorted(in_sp_no_labels),
-        "aligned_count":     len(aligned_ids),
-        "emb_map":           emb_map,
-        "sp_map":            sp_map if sp_layout == "flat" else {},
+        "emb_count":          len(emb_ids),
+        "sp_count":           len(sp_ids),
+        "emb_layout":         emb_layout,
+        "sp_layout":          sp_layout,
+        "emb_info":           emb_info,
+        "sp_info":            sp_info,
+        "emb_is_matrix":      emb_is_matrix if emb_layout == "flat" else False,
+        "emb_is_object":      emb_is_object if emb_layout == "flat" else False,
+        "sp_is_object":       sp_is_object  if sp_layout  == "flat" else False,
+        "in_labels_no_emb":   sorted(in_labels_no_emb),
+        "in_labels_no_sp":    sorted(in_labels_no_sp),
+        "in_emb_no_labels":   sorted(in_emb_no_labels),
+        "in_sp_no_labels":    sorted(in_sp_no_labels),
+        "aligned_count":      len(aligned_ids),
+        "emb_map":            emb_map,
+        "sp_map":             sp_map if sp_layout == "flat" else {},
+        # sample paths for --inspect
+        "_sample_emb_file":   sample_files[0] if emb_layout == "flat" else None,
+        "_sample_sp_file":    (sp_map[next(iter(sp_map))][0]
+                               if sp_layout == "flat" and sp_map else None),
     }
     return aligned_ids, report
 
@@ -401,9 +466,24 @@ def reorganize(
                 logger.warning("No embedding files for slide '%s' — skipping.", sid)
                 continue
 
-            if emb_is_matrix:
+            if emb_is_object:
+                # Case O: object-dtype file — extract embedded array from dict/object
+                # Common keys used by SMMILe upstream code
+                EMB_KEYS = ["feat", "feature", "features", "embedding", "embeddings", "x", "data"]
+                raw = extract_array_from_object(files[0], EMB_KEYS)
+                if raw.ndim == 1:
+                    raw = raw[np.newaxis, :]    # (D,) → (1, D)
+                # raw is now (N, D) or (D,); treat as matrix
+                mat = raw.astype(np.float32)
+                n_patches = mat.shape[0]
+                coords_rows = []
+                for idx in range(n_patches):
+                    x, y, ps = idx, 0, 512
+                    np.save(str(slide_out / f"{x}_{y}_{ps}.npy"), mat[idx])
+                    coords_rows.append({"x": x, "y": y, "patch_size": ps})
+            elif emb_is_matrix:
                 # Case B: single (N, D) matrix per slide
-                mat = np.load(str(files[0]))    # (N, D)
+                mat = np.load(str(files[0])).astype(np.float32)
                 n_patches = mat.shape[0]
                 coords_rows = []
                 for idx in range(n_patches):
@@ -434,10 +514,17 @@ def reorganize(
         elif sp_layout == "flat" and sid in sp_map:
             files_sp = sorted(sp_map[sid])
             if not sp_out.exists():
-                # Load, squeeze to 1D, save
-                arr = np.load(str(files_sp[0]))
-                if arr.ndim == 2:
-                    arr = arr.squeeze()
+                SP_KEYS = ["sp", "superpixel", "superpixels", "label", "labels", "seg", "data"]
+                if report["sp_is_object"]:
+                    arr = extract_array_from_object(files_sp[0], SP_KEYS)
+                else:
+                    arr = np.load(str(files_sp[0]), allow_pickle=False)
+                arr = arr.squeeze()
+                if arr.ndim != 1:
+                    raise ValueError(
+                        f"Superpixel array for '{sid}' has unexpected shape {arr.shape} "
+                        f"after squeeze — expected 1D. File: {files_sp[0].name}"
+                    )
                 np.save(str(sp_out), arr.astype(np.int64))
 
     logger.info("Reorganisation complete.")
@@ -480,6 +567,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_filtered_labels", type=Path, default=None,
                    help="If set, write a filtered labels.csv containing only "
                         "the aligned slide IDs.")
+    p.add_argument("--inspect", action="store_true",
+                   help="Load one sample embedding and superpixel file and print "
+                        "their internal structure (useful for object-dtype .npy files).")
     return p.parse_args()
 
 
@@ -492,6 +582,22 @@ def main() -> None:
     # --- Validate ---
     aligned_ids, report = validate(args.labels, args.emb_dir, args.sp_dir)
     print_report(report, aligned_ids)
+
+    # --- Inspect sample files if requested ---
+    if args.inspect:
+        sep = "─" * 70
+        print(f"\n{sep}")
+        print("  FILE INSPECTION (sample files)")
+        print(sep)
+        emb_sample = report["_sample_emb_file"]
+        sp_sample  = report["_sample_sp_file"]
+        if emb_sample:
+            print("\nEmbedding sample:")
+            print(inspect_object_npy(emb_sample))
+        if sp_sample:
+            print("\nSuperpixel sample:")
+            print(inspect_object_npy(sp_sample))
+        print(f"\n{sep}\n")
 
     # --- Save filtered labels if requested ---
     if args.save_filtered_labels:
