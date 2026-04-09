@@ -144,9 +144,9 @@ def _extract_coords_from_object(arr: np.ndarray) -> np.ndarray | None:
     if not isinstance(obj, dict):
         return None
     for key in _COORD_KEYS:
-        if key in obj and isinstance(obj[key], np.ndarray):
-            c = obj[key]
-            if c.ndim == 2 and c.shape[1] >= 2:
+        if key in obj:
+            c = _to_ndarray(obj[key])
+            if c is not None and c.ndim == 2 and c.shape[1] >= 2:
                 return c[:, :2].astype(np.int64)
     return None
 
@@ -211,7 +211,7 @@ class MILDataset(Dataset):
         label    = self.labels[slide_id]
 
         embeddings, coords = self._load_embeddings(slide_id)
-        superpixels = self._load_superpixels(slide_id, n_patches=len(embeddings))
+        superpixels = self._load_superpixels(slide_id, n_patches=len(embeddings), coords=coords)
 
         if self.augment:
             embeddings, superpixels, coords = _random_patch_drop(
@@ -306,13 +306,17 @@ class MILDataset(Dataset):
         return emb_mat, coords_arr.astype(np.int64)
 
     def _load_superpixels(
-        self, slide_id: str, n_patches: int
+        self, slide_id: str, n_patches: int, coords: np.ndarray | None = None
     ) -> np.ndarray:
         """Return superpixel label array aligned with *_load_embeddings* order.
 
         Auto-detects layout:
           Structured — ``<sp_dir>/<slide_id>.npy``
           Flat       — ``<sp_dir>/<slide_id>_*.npy``
+
+        For HuggingFace flat files, ``inst_label`` is a 2D grid ``(H, W)`` of
+        superpatch IDs.  When *coords* are grid positions ``(row, col)``,
+        we index into the grid to produce the 1D alignment array.
 
         Falls back to a trivial identity map when the file is missing.
         """
@@ -335,7 +339,12 @@ class MILDataset(Dataset):
         sp = _extract_from_object(raw, _SP_KEYS) if raw.dtype == object else raw
         sp = sp.squeeze()
 
-        if sp.ndim != 1:
+        # ---- Handle 2D grid layout (HuggingFace inst_label) ----
+        if sp.ndim == 2:
+            if coords is not None and len(coords) == n_patches:
+                rows = np.clip(coords[:, 0], 0, sp.shape[0] - 1)
+                cols = np.clip(coords[:, 1], 0, sp.shape[1] - 1)
+                return sp[rows, cols].astype(np.int64)
             logger.warning(
                 "Superpixel array for '%s' has unexpected shape %s after squeeze — "
                 "using trivial identity map.", slide_id, sp.shape
