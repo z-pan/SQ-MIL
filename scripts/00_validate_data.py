@@ -138,7 +138,11 @@ def scan_structured_dir(directory: Path) -> dict[str, Path]:
 
 def probe_npy(path: Path) -> tuple[tuple[int, ...], str]:
     """Return (shape, dtype_str) of a .npy file."""
-    arr = np.load(str(path), mmap_mode="r")
+    try:
+        arr = np.load(str(path), mmap_mode="r")
+    except ValueError:
+        # Object-dtype arrays cannot be memory-mapped; fall back to full load
+        arr = np.load(str(path), allow_pickle=True)
     return arr.shape, str(arr.dtype)
 
 
