@@ -16,17 +16,29 @@ Label mapping (5-subtype UBC-OCEAN task)
   LGSC → 3    (low-grade serous carcinoma)
   MC   → 4    (mucinous carcinoma)
 
-Embeddings layout on disk
---------------------------
+Supported embedding layouts on disk
+-------------------------------------
+Layout A — structured (produced by scripts/01_extract_features.py):
   <embedding_dir>/
       <slide_id>/
           coords.csv           columns: x, y, patch_size
           <x>_<y>_<size>.npy  one float32 vector per tissue patch
 
-Superpixel layout
------------------
-  <superpixel_dir>/
-      <slide_id>.npy           int64 (N,) — label per patch in coords.csv order
+Layout B — flat/HuggingFace (zeyugao/SMMILe_Datasets):
+  <embedding_dir>/
+      <slide_id>_*.npy        one file per slide; either
+                                  • float32 matrix  (N, D)
+                                  • object-dtype dict with keys such as
+                                    'feat'/'feature'/'features'/'embedding'
+                                    and optionally 'coord'/'coords'
+
+The loader auto-detects the layout per slide at runtime — no reorganisation needed.
+
+Supported superpixel layouts
+------------------------------
+Layout A — structured:  <superpixel_dir>/<slide_id>.npy          int64 (N,)
+Layout B — flat:        <superpixel_dir>/<slide_id>_*.npy        as above or
+                            object-dtype dict with key 'sp'/'superpixel'/'label'
 
 Split CSV format (produced by scripts/03_prepare_splits.py)
 -------------------------------------------------------------
@@ -65,6 +77,56 @@ IDX_TO_LABEL: dict[int, str] = {v: k for k, v in LABEL_MAP.items()}
 NUM_CLASSES: int = len(LABEL_MAP)
 
 SplitName = Literal["train", "val", "test"]
+
+# Keys tried in order when extracting arrays from object-dtype .npy dicts
+_EMB_KEYS = ("feat", "feature", "features", "embedding", "embeddings", "x", "data")
+_SP_KEYS  = ("sp", "superpixel", "superpixels", "label", "labels", "seg", "data")
+_COORD_KEYS = ("coord", "coords", "coordinate", "coordinates", "position", "pos")
+
+
+# ---------------------------------------------------------------------------
+# Object-dtype helpers (shared with scripts/00_validate_data.py)
+# ---------------------------------------------------------------------------
+
+def _load_npy(path: Path) -> np.ndarray:
+    """Load a .npy file, falling back to allow_pickle for object-dtype files."""
+    try:
+        return np.load(str(path), mmap_mode="r")
+    except ValueError:
+        return np.load(str(path), allow_pickle=True)
+
+
+def _extract_from_object(arr: np.ndarray, preferred_keys: tuple[str, ...]) -> np.ndarray:
+    """Unwrap an object-dtype scalar array and return the embedded ndarray."""
+    obj = arr.item() if arr.shape == () else arr
+    if isinstance(obj, np.ndarray):
+        return obj
+    if isinstance(obj, dict):
+        for key in preferred_keys:
+            if key in obj and isinstance(obj[key], np.ndarray):
+                return obj[key]
+        # fallback: first ndarray value
+        for val in obj.values():
+            if isinstance(val, np.ndarray):
+                return val
+        raise KeyError(
+            f"No ndarray found under keys {preferred_keys}. "
+            f"Dict contains: {list(obj.keys())}"
+        )
+    raise TypeError(f"Cannot extract ndarray from {type(obj).__name__}")
+
+
+def _extract_coords_from_object(arr: np.ndarray) -> np.ndarray | None:
+    """Try to extract a coordinate array from an object-dtype dict; return None if absent."""
+    obj = arr.item() if arr.shape == () else arr
+    if not isinstance(obj, dict):
+        return None
+    for key in _COORD_KEYS:
+        if key in obj and isinstance(obj[key], np.ndarray):
+            c = obj[key]
+            if c.ndim == 2 and c.shape[1] >= 2:
+                return c[:, :2].astype(np.int64)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -153,59 +215,110 @@ class MILDataset(Dataset):
 
         embeddings : (N, D) float32
         coords     : (N, 2) int64   — columns are (x, y)
+
+        Auto-detects layout:
+          Structured — ``<emb_dir>/<slide_id>/coords.csv`` + per-patch .npy files
+          Flat       — ``<emb_dir>/<slide_id>_*.npy`` (matrix or object-dtype dict)
         """
         slide_dir  = self.embedding_dir / slide_id
         coords_csv = slide_dir / "coords.csv"
 
-        if not coords_csv.exists():
+        # ---- Layout A: structured (our extraction script output) ----
+        if coords_csv.exists():
+            coords_df = pd.read_csv(coords_csv)
+            emb_list:    list[np.ndarray]     = []
+            coords_list: list[tuple[int, int]] = []
+
+            for _, row in coords_df.iterrows():
+                x, y, ps = int(row["x"]), int(row["y"]), int(row["patch_size"])
+                npy_path = slide_dir / f"{x}_{y}_{ps}.npy"
+                if not npy_path.exists():
+                    logger.warning("Missing embedding: %s — skipping.", npy_path.name)
+                    continue
+                emb_list.append(np.load(str(npy_path)).astype(np.float32))
+                coords_list.append((x, y))
+
+            if not emb_list:
+                raise RuntimeError(
+                    f"No valid embeddings found for slide '{slide_id}' "
+                    f"(structured layout). Check that script 01 completed."
+                )
+            return (
+                np.stack(emb_list, axis=0),
+                np.array(coords_list, dtype=np.int64),
+            )
+
+        # ---- Layout B: flat / HuggingFace ----
+        flat_files = sorted(self.embedding_dir.glob(f"{slide_id}_*.npy"))
+        if not flat_files:
             raise FileNotFoundError(
-                f"Coordinate file not found: {coords_csv}. "
-                "Run scripts/01_extract_features.py first."
+                f"No embedding files found for slide '{slide_id}'.\n"
+                f"  Checked structured path : {coords_csv}\n"
+                f"  Checked flat pattern    : {self.embedding_dir / (slide_id + '_*.npy')}\n"
+                "Run scripts/01_extract_features.py or provide HuggingFace embeddings."
             )
 
-        coords_df = pd.read_csv(coords_csv)
-        emb_list:    list[np.ndarray]    = []
-        coords_list: list[tuple[int,int]] = []
+        raw = _load_npy(flat_files[0])
 
-        for _, row in coords_df.iterrows():
-            x, y, ps = int(row["x"]), int(row["y"]), int(row["patch_size"])
-            npy_path = slide_dir / f"{x}_{y}_{ps}.npy"
-            if not npy_path.exists():
-                logger.warning("Missing embedding: %s — skipping.", npy_path.name)
-                continue
-            emb_list.append(np.load(str(npy_path)).astype(np.float32))
-            coords_list.append((x, y))
+        if raw.dtype == object:
+            # Object-dtype dict: extract feature matrix and optional coords
+            coords_from_dict = _extract_coords_from_object(raw)
+            emb_mat = _extract_from_object(raw, _EMB_KEYS).astype(np.float32)
+        else:
+            coords_from_dict = None
+            emb_mat = raw.astype(np.float32)
 
-        if not emb_list:
-            raise RuntimeError(
-                f"No valid embeddings found for slide '{slide_id}'. "
-                "Check that script 01 completed successfully."
-            )
+        # emb_mat may be (N, D) or (D,) for a single patch
+        if emb_mat.ndim == 1:
+            emb_mat = emb_mat[np.newaxis, :]
 
-        return (
-            np.stack(emb_list, axis=0),                     # (N, D) float32
-            np.array(coords_list, dtype=np.int64),          # (N, 2) int64
-        )
+        n = emb_mat.shape[0]
+
+        if coords_from_dict is not None and len(coords_from_dict) == n:
+            coords_arr = coords_from_dict
+        else:
+            # Synthetic coords: x = patch index, y = 0
+            # Training is unaffected; heatmaps need real coords from raw WSIs.
+            coords_arr = np.column_stack([np.arange(n), np.zeros(n, dtype=np.int64)])
+
+        return emb_mat, coords_arr.astype(np.int64)
 
     def _load_superpixels(
         self, slide_id: str, n_patches: int
     ) -> np.ndarray:
         """Return superpixel label array aligned with *_load_embeddings* order.
 
-        Falls back to a trivial identity map (every patch its own superpatch)
-        when the .npy file is missing, with a logged warning.
-        """
-        sp_path = self.superpixel_dir / f"{slide_id}.npy"
+        Auto-detects layout:
+          Structured — ``<sp_dir>/<slide_id>.npy``
+          Flat       — ``<sp_dir>/<slide_id>_*.npy``
 
+        Falls back to a trivial identity map when the file is missing.
+        """
+        # ---- Layout A: structured ----
+        sp_path = self.superpixel_dir / f"{slide_id}.npy"
         if not sp_path.exists():
+            # ---- Layout B: flat ----
+            flat_sp = sorted(self.superpixel_dir.glob(f"{slide_id}_*.npy"))
+            if flat_sp:
+                sp_path = flat_sp[0]
+            else:
+                logger.warning(
+                    "Superpixel file not found for '%s' — "
+                    "using trivial identity map (each patch = one superpatch).",
+                    slide_id,
+                )
+                return np.arange(n_patches, dtype=np.int64)
+
+        raw = _load_npy(sp_path)
+        sp = _extract_from_object(raw, _SP_KEYS) if raw.dtype == object else raw
+        sp = sp.squeeze()
+
+        if sp.ndim != 1:
             logger.warning(
-                "Superpixel file not found for '%s' — "
-                "using trivial identity map (each patch = one superpatch).",
-                slide_id,
+                "Superpixel array for '%s' has unexpected shape %s after squeeze — "
+                "using trivial identity map.", slide_id, sp.shape
             )
             return np.arange(n_patches, dtype=np.int64)
-
-        sp = np.load(str(sp_path))
 
         if len(sp) != n_patches:
             logger.warning(
@@ -216,8 +329,7 @@ class MILDataset(Dataset):
             if len(sp) > n_patches:
                 sp = sp[:n_patches]
             else:
-                sp = np.pad(sp, (0, n_patches - len(sp)),
-                            mode="edge")
+                sp = np.pad(sp, (0, n_patches - len(sp)), mode="edge")
 
         return sp.astype(np.int64)
 
