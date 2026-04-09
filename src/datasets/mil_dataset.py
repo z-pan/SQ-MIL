@@ -338,6 +338,22 @@ class MILDataset(Dataset):
 # Augmentation helper (module-level so it can be tested independently)
 # ---------------------------------------------------------------------------
 
+def _normalize_slide_id(sid: str) -> str:
+    """Normalize slide ID strings so numeric IDs are consistent.
+
+    Converts float-like strings produced by pandas CSV round-trips
+    (e.g. ``'11417.0'``) to plain integer strings (``'11417'``).
+    Non-numeric IDs such as ``'TCGA-01-A234'`` are returned unchanged.
+    """
+    try:
+        f = float(sid)
+        if f == int(f):
+            return str(int(f))
+    except (ValueError, OverflowError):
+        pass
+    return sid
+
+
 def _random_patch_drop(
     embeddings:  np.ndarray,
     superpixels: np.ndarray,
@@ -368,7 +384,7 @@ def load_labels(labels_csv: str | Path) -> dict[str, int]:
 
     result: dict[str, int] = {}
     for _, row in df.iterrows():
-        sid = str(row["slide_id"])
+        sid = _normalize_slide_id(str(row["slide_id"]))
         raw = row["label"]
 
         if isinstance(raw, str):
@@ -401,7 +417,7 @@ def load_split_ids(
             f"Column '{split}' not found in {split_csv}. "
             f"Available columns: {list(df.columns)}."
         )
-    return df[split].dropna().astype(str).tolist()
+    return [_normalize_slide_id(s) for s in df[split].dropna().astype(str).tolist()]
 
 
 def build_dataset(
