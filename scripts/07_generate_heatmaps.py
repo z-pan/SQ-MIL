@@ -77,12 +77,15 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Required
+    # Optional — if omitted, heatmaps are generated without a tissue background
+    # (a synthetic gray canvas is used instead).
     p.add_argument(
-        "--wsi_dir", required=True,
+        "--wsi_dir", default=None,
         help=(
             "Glob pattern for .tif WSIs (e.g. 'data/wsi/*.tif'), a single .tif "
-            "file path, or a directory containing .tif files."
+            "file path, or a directory containing .tif files.  "
+            "If omitted, a synthetic canvas is used — useful when raw WSI files "
+            "are unavailable (e.g. when using pre-extracted HuggingFace embeddings)."
         ),
     )
     p.add_argument(
@@ -187,28 +190,25 @@ def main() -> None:
 
     args = parse_args()
 
-    # ---- Resolve WSI paths -----------------------------------------------
-    wsi_paths = _resolve_wsi_paths(args.wsi_dir, args.slide_id)
-    if not wsi_paths:
-        logger.error(
-            "No .tif files matched: %s%s",
-            args.wsi_dir,
-            f" (slide_id filter: {args.slide_id})" if args.slide_id else "",
-        )
-        sys.exit(1)
-    logger.info("Found %d WSI file(s).", len(wsi_paths))
+    # ---- Resolve WSI paths (optional) ------------------------------------
+    if args.wsi_dir is not None:
+        wsi_paths = _resolve_wsi_paths(args.wsi_dir, args.slide_id)
+        if not wsi_paths:
+            logger.warning(
+                "No .tif files matched: %s — switching to no-WSI mode.",
+                args.wsi_dir,
+            )
+            wsi_paths = []
+    else:
+        wsi_paths = []
+        logger.info("--wsi_dir not provided — using synthetic canvas (no-WSI mode).")
 
     # ---- Handle single-CSV prediction file --------------------------------
     pred_input = Path(args.predictions_dir)
     if pred_input.is_file() and pred_input.suffix == ".csv":
-        # User passed a single CSV; wrap it in a temporary directory context
-        # by setting predictions_dir to its parent and filtering later.
-        predictions_dir = pred_input.parent
-        # Pre-load the CSV to pass directly to generate() for single-slide
-        # mode (avoids rescanning).
         import pandas as pd
         single_pred_df = pd.read_csv(pred_input)
-        predictions_dir_str = str(predictions_dir)
+        predictions_dir_str = str(pred_input.parent)
     else:
         single_pred_df = None
         predictions_dir_str = str(args.predictions_dir)
@@ -268,7 +268,7 @@ def main() -> None:
 
     # ---- Batch mode ------------------------------------------------------
     results = gen.generate_batch(
-        wsi_dir         = args.wsi_dir,
+        wsi_dir         = args.wsi_dir,   # None → no-WSI mode
         predictions_dir = predictions_dir_str,
         output_dir      = str(output_dir),
         num_workers     = args.num_workers,
@@ -283,7 +283,6 @@ def main() -> None:
     logger.info("Heatmap generation complete.")
     logger.info("  Generated : %d", ok_count)
     logger.info("  Failed    : %d", err_count)
-    logger.info("  Skipped   : %d (no predictions)", len(wsi_paths) - len(results))
     logger.info("  Output dir: %s", output_dir)
 
     if err_count:

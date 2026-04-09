@@ -134,7 +134,7 @@ class HeatmapGenerator:
 
     def generate(
         self,
-        wsi_path: str | Path,
+        wsi_path: str | Path | None,
         predictions_df: pd.DataFrame,
         output_path: str | Path,
         show_gt: bool = False,
@@ -145,7 +145,9 @@ class HeatmapGenerator:
         Parameters
         ----------
         wsi_path:
-            Path to the ``.tif`` WSI file.
+            Path to the ``.tif`` WSI file, or ``None`` / a non-existent path
+            to run in *no-WSI mode*: a white canvas sized to the patch
+            coordinate bounding box is used instead of a tissue thumbnail.
         predictions_df:
             Instance prediction DataFrame (see module docstring for accepted
             column layouts).
@@ -171,13 +173,25 @@ class HeatmapGenerator:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        slide_id = wsi_path.stem
+        wsi_path = Path(wsi_path) if wsi_path is not None else None
+        no_wsi   = wsi_path is None or not wsi_path.exists()
+        slide_id = wsi_path.stem if wsi_path is not None else Path(str(output_path)).stem.replace("_heatmap", "")
 
         # ---- Normalise DataFrames ----------------------------------------
         preds = self._normalize_df(predictions_df)
 
-        # ---- Load WSI thumbnail -----------------------------------------
-        thumbnail_pil, (wsi_w, wsi_h) = self._load_thumbnail(wsi_path)
+        # ---- Load WSI thumbnail (or synthetic canvas) --------------------
+        if no_wsi:
+            thumbnail_pil, (wsi_w, wsi_h) = self._synthetic_canvas(preds)
+            if wsi_path is not None:
+                logger.warning(
+                    "WSI file not found for '%s' — using synthetic canvas. "
+                    "Heatmap shows spatial layout of patches only (no tissue background).",
+                    slide_id,
+                )
+        else:
+            thumbnail_pil, (wsi_w, wsi_h) = self._load_thumbnail(wsi_path)
+
         thumb_arr = np.array(thumbnail_pil)          # (H, W, 3) uint8
         thumb_h, thumb_w = thumb_arr.shape[:2]
 
@@ -266,7 +280,7 @@ class HeatmapGenerator:
 
     def generate_batch(
         self,
-        wsi_dir: str | Path,
+        wsi_dir: str | Path | None,
         predictions_dir: str | Path,
         output_dir: str | Path,
         num_workers: int = 8,
@@ -299,21 +313,25 @@ class HeatmapGenerator:
         """
         import glob
 
-        # ---- Resolve WSI paths ------------------------------------------
-        wsi_dir_s = str(wsi_dir)
-        if "*" in wsi_dir_s or "?" in wsi_dir_s:
-            wsi_paths = sorted(Path(p) for p in glob.glob(wsi_dir_s))
-        else:
-            wsi_paths = sorted(Path(wsi_dir_s).glob("*.tif"))
-
-        if not wsi_paths:
-            logger.warning("No .tif files found matching: %s", wsi_dir_s)
-            return {}
-        logger.info("Batch mode: %d WSI files found.", len(wsi_paths))
-
         # ---- Build slide_id → predictions mapping -----------------------
         pred_map = self._load_predictions_dir(Path(predictions_dir))
         logger.info("Loaded predictions for %d slides.", len(pred_map))
+
+        # ---- Resolve WSI paths (optional) --------------------------------
+        wsi_map: dict[str, Path] = {}
+        if wsi_dir is not None:
+            wsi_dir_s = str(wsi_dir)
+            if "*" in wsi_dir_s or "?" in wsi_dir_s:
+                wsi_paths = sorted(Path(p) for p in glob.glob(wsi_dir_s))
+            else:
+                wsi_paths = sorted(Path(wsi_dir_s).glob("*.tif"))
+            wsi_map = {p.stem: p for p in wsi_paths}
+            if wsi_map:
+                logger.info("Found %d WSI file(s).", len(wsi_map))
+            else:
+                logger.warning("No .tif files found in: %s — running in no-WSI mode.", wsi_dir_s)
+        else:
+            logger.info("No wsi_dir provided — running in no-WSI mode (synthetic canvas).")
 
         # ---- GT mapping (optional) --------------------------------------
         gt_map: dict[str, pd.DataFrame] = {}
@@ -323,13 +341,11 @@ class HeatmapGenerator:
         output_dir_p = Path(output_dir)
         output_dir_p.mkdir(parents=True, exist_ok=True)
 
-        # ---- Parallel execution -----------------------------------------
+        # ---- Parallel execution (iterate over prediction slide IDs) ------
         results: dict[str, Path | Exception] = {}
 
-        def _process(wsi_path: Path) -> tuple[str, Path | Exception]:
-            sid = wsi_path.stem
-            if sid not in pred_map:
-                return sid, FileNotFoundError(f"No predictions found for '{sid}'")
+        def _process(sid: str) -> tuple[str, Path | Exception]:
+            wsi_path = wsi_map.get(sid)   # None → no-WSI mode for this slide
             out_path = output_dir_p / f"{sid}_heatmap.png"
             gt_df    = gt_map.get(sid, None)
             try:
@@ -345,7 +361,7 @@ class HeatmapGenerator:
                 return sid, exc
 
         with ThreadPoolExecutor(max_workers=num_workers) as pool:
-            futures = {pool.submit(_process, p): p.stem for p in wsi_paths}
+            futures = {pool.submit(_process, sid): sid for sid in pred_map}
             for fut in as_completed(futures):
                 sid, outcome = fut.result()
                 results[sid] = outcome
@@ -376,6 +392,35 @@ class HeatmapGenerator:
             dims     = reader.get_dimensions()   # (w, h) at level 0
             thumbnail = reader.get_thumbnail(self.thumbnail_size)
         return thumbnail.convert("RGB"), dims
+
+    def _synthetic_canvas(
+        self, df: pd.DataFrame
+    ) -> tuple[Image.Image, tuple[int, int]]:
+        """Create a white canvas sized to the patch coordinate bounding box.
+
+        Used when no WSI file is available.  The canvas preserves the spatial
+        layout of patches so heatmap colors are positioned correctly relative
+        to each other, even without the tissue background.
+
+        Returns the same ``(PIL.Image, (wsi_w, wsi_h))`` tuple as
+        ``_load_thumbnail`` so the rest of ``generate()`` is unchanged.
+        """
+        patch_size = int(df["patch_size"].mode().iloc[0]) if "patch_size" in df.columns else 512
+        xs = pd.to_numeric(df["x"], errors="coerce").fillna(0).astype(int)
+        ys = pd.to_numeric(df["y"], errors="coerce").fillna(0).astype(int)
+
+        wsi_w = int(xs.max()) + patch_size
+        wsi_h = int(ys.max()) + patch_size
+
+        # Scale to thumbnail_size while preserving aspect ratio
+        max_dim = max(self.thumbnail_size)
+        scale   = min(max_dim / wsi_w, max_dim / wsi_h)
+        thumb_w = max(1, int(wsi_w * scale))
+        thumb_h = max(1, int(wsi_h * scale))
+
+        # Light-gray canvas (distinguishable from white background regions)
+        canvas = Image.new("RGB", (thumb_w, thumb_h), color=(220, 220, 220))
+        return canvas, (wsi_w, wsi_h)
 
     def _normalize_df(self, df: pd.DataFrame) -> pd.DataFrame:
         """Normalise column names; add ``patch_size`` and ``pred_class_int``."""
