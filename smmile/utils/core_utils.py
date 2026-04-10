@@ -162,7 +162,7 @@ def train(datasets, cur, args):
 
     print('\nInit optimizer ...', end=' ')
     optimizer = get_optim(model, args)
-    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
     print('Done!')
     
     print('\nInit Loaders...', end=' ')
