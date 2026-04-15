@@ -469,6 +469,12 @@ class SMMILeTrainer:
             stage, best_val, best_path,
         )
         self._best_ckpt = best_path
+
+        # Reload best checkpoint so self.model is always the best model
+        # after training (not the last epoch, which may be worse due to
+        # early stopping or noisy val loss at the end of training).
+        self._load_weights(best_path, strict=True)
+
         return best_path
 
     def _train_epoch(

@@ -187,10 +187,13 @@ class SMMILe(nn.Module):
         # Guard: if all positions are -inf (n_drop == K), return uniform.
         A_drop = F.softmax(A_raw_drop, dim=-1)
 
-        # Replace NaN rows (all -inf → softmax gives NaN) with uniform
-        nan_rows = A_drop.isnan().any(dim=-1)
-        if nan_rows.any():
-            A_drop[nan_rows] = 1.0 / K
+        # Replace NaN rows (all -inf → softmax gives NaN) with uniform.
+        # Use torch.where to avoid in-place modification of the softmax output,
+        # which would break autograd (version mismatch on SoftmaxBackward0).
+        nan_mask = A_drop.isnan().any(dim=-1, keepdim=True)  # (C, 1) bool
+        if nan_mask.any():
+            uniform = torch.full_like(A_drop, 1.0 / K)
+            A_drop = torch.where(nan_mask.expand_as(A_drop), uniform, A_drop)
 
         return A_drop
 
