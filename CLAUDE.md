@@ -8,6 +8,25 @@ This project (**SQ-MIL**) implements the **SMMILe** (Superpatch-based Measurable
 - **Upstream repo**: https://github.com/ZeyuGaoAi/SMMILe (GPLv3)
 - **This repo**: https://github.com/z-pan/SQ-MIL.git
 
+## Commands
+
+```bash
+# Feature extraction from .tif WSIs
+python scripts/01_extract_features.py --wsi_dir data/wsi --output_dir data/embeddings
+
+# Superpixel generation
+python scripts/02_generate_superpixels.py --wsi_dir data/wsi --output_dir data/superpixels
+
+# Train Stage 1
+bash scripts/04_train_stage1.sh
+
+# Train Stage 2
+bash scripts/05_train_stage2.sh
+
+# Generate heatmaps (HIGHEST PRIORITY deliverable)
+python scripts/07_generate_heatmaps.py --wsi_dir 'data/wsi/*.tif' --output_dir results/heatmaps
+```
+
 ## Critical Data Format
 
 All WSI images are in **`.tif` format** (NOT `.svs`). This includes:
@@ -16,7 +35,7 @@ All WSI images are in **`.tif` format** (NOT `.svs`). This includes:
 
 The upstream SMMILe `generate_heatmap.py` uses `openslide.OpenSlide()` which supports `.tif`/`.tiff` (BigTIFF/TIFF via OpenSlide), but the glob pattern and file handling must be adapted from `*.svs` to `*.tif`.
 
-## Task: Ovarian Cancer 5-Subtype Classification
+## Task
 
 - **Dataset**: UBC-OCEAN (513 WSIs) + custom lab data
 - **Classes**: CC (clear cell), EC (endometrioid), HGSC (high-grade serous), LGSC (low-grade serous), MC (mucinous) — 5 subtypes
@@ -24,78 +43,11 @@ The upstream SMMILe `generate_heatmap.py` uses `openslide.OpenSlide()` which sup
 - **Encoder**: Conch (pathology foundation model, 512-dim embeddings) preferred; ResNet-50 (ImageNet, 1024-dim) as fallback
 - **Patch size**: 512×512 at 20× magnification, level=0
 
-## Architecture Summary
+## Architecture
 
-SMMILe has two training stages:
+Stage 1 — Primary Network: frozen encoder → convolutional layer (3×3, NIC-based) → gated attention instance detector + instance classifier. Uses instance dropout (InD) and SLIC superpatch-based pseudo-bag generation (InS). 40 epochs (Conch) / 200 epochs (ResNet-50).
 
-### Stage 1 — Primary Network
-- Frozen pretrained encoder → convolutional layer (3×3, NIC-based) → instance detector (gated attention, per-category) + instance classifier
-- Parameter-free instance dropout (InD): drops high-scoring instances stochastically
-- Delocalized instance sampling (InS): SLIC superpatch-based pseudo-bag generation
-- Loss: BCE classification loss (L_cls)
-- Epochs: 40 (Conch) or 200 (ResNet-50)
-
-### Stage 2 — Instance Refinement + MRF
-- Loads Stage 1 weights
-- Adds N=3 refinement linear layers with progressive pseudo-labeling (top-θ% selection, θ=10%)
-- Adds superpatch-based MRF constraint for spatial smoothness (λ1=0.8, λ2=0.2)
-- Loss: L_cls + L_ref + L_mrf (+ L_cons if dataset has normal cases)
-- Epochs: 20 (Conch) or 100 (ResNet-50)
-
-### Inference & Heatmaps
-- WSI-level: dot product of detection and classification scores → bag prediction
-- Patch-level: last refinement layer v_N(·) outputs (C+1)-dim softmax → spatial prediction per patch
-- Heatmap: overlay patch predictions on WSI thumbnail using colormap + Gaussian smoothing
-
-## Directory Structure to Generate
-
-```
-SQ-MIL/
-├── CLAUDE.md                          # This file
-├── README.md
-├── requirements.txt
-├── configs/
-│   ├── ovarian_conch_s1.yaml          # Stage 1 config
-│   └── ovarian_conch_s2.yaml          # Stage 2 config
-├── scripts/
-│   ├── 01_extract_features.py         # Patch embedding extraction from .tif WSIs
-│   ├── 02_generate_superpixels.py     # SLIC superpixel segmentation
-│   ├── 03_prepare_splits.py           # 5-fold CV split generation
-│   ├── 04_train_stage1.sh             # Stage 1 training shell script
-│   ├── 05_train_stage2.sh             # Stage 2 training shell script
-│   ├── 06_evaluate.sh                 # Evaluation shell script
-│   └── 07_generate_heatmaps.py        # Heatmap generation (adapted for .tif)
-├── src/
-│   ├── __init__.py
-│   ├── models/
-│   │   ├── __init__.py
-│   │   ├── smmile.py                  # SMMILe model definition
-│   │   ├── attention.py               # Gated attention mechanism
-│   │   ├── instance_refinement.py     # Instance refinement network
-│   │   └── nic.py                     # Neural image compression layer
-│   ├── datasets/
-│   │   ├── __init__.py
-│   │   ├── mil_dataset.py             # MIL dataset loader (embeddings + superpixels)
-│   │   └── wsi_utils.py               # WSI reading utilities (.tif support)
-│   ├── training/
-│   │   ├── __init__.py
-│   │   ├── trainer.py                 # Training loop (Stage 1 + Stage 2)
-│   │   ├── losses.py                  # All loss functions (L_cls, L_cons, L_ref, L_mrf)
-│   │   └── evaluator.py              # Evaluation metrics
-│   └── visualization/
-│       ├── __init__.py
-│       └── heatmap.py                 # Heatmap generation core (adapted for .tif)
-├── data/                              # Data directory (not tracked in git)
-│   ├── wsi/                           # Raw .tif WSI files
-│   ├── embeddings/                    # Extracted patch embeddings (.npy)
-│   ├── superpixels/                   # Superpixel segmentation results (.npy)
-│   ├── splits/                        # Cross-validation split CSVs
-│   └── labels.csv                     # slide_id, label columns
-└── results/                           # Training results + heatmaps (not tracked)
-    ├── stage1/
-    ├── stage2/
-    └── heatmaps/
-```
+Stage 2 — Instance Refinement: loads Stage 1 weights, adds N=3 refinement layers with progressive pseudo-labeling (θ=10%), MRF spatial smoothness constraint (λ1=0.8, λ2=0.2). 20 epochs (Conch) / 100 epochs (ResNet-50).
 
 ## Key Implementation Requirements
 
@@ -157,35 +109,16 @@ SUBTYPE_COLORS = {
 - Patch-level spatial quantification: macro AUC, macro F1, accuracy, precision, recall
 - Per-fold and mean±std across 5 folds
 
-## Upstream Code Reference
+## Upstream Reference
 
-The SMMILe original repo structure:
-```
-SMMILe/
-├── single/           # Binary & multiclass classification (USE THIS for UBC-OCEAN)
-│   ├── main.py       # Training entry point
-│   ├── eval.py       # Evaluation entry point
-│   ├── demo.py       # Single WSI demo
-│   ├── metric_calculate.py
-│   ├── models/       # Model definitions
-│   ├── datasets/     # Dataset loaders
-│   └── configs_*/    # YAML configs per dataset
-├── multi/            # Multilabel classification (NOT for UBC-OCEAN)
-├── feature_extraction.py      # From raw WSI
-├── feature_extraction_patch.py # From pre-tessellated patches
-├── superpixel_generation.py
-├── generate_heatmap.py        # Heatmap overlay (uses openslide, expects .svs)
-└── pre_utils.py               # Preprocessing utilities
-```
-
-Key upstream files to study and adapt:
+Key files to study and adapt from the SMMILe upstream repo (https://github.com/ZeyuGaoAi/SMMILe):
 - `single/main.py` — training loop with Stage 1/Stage 2 logic
 - `single/models/` — SMMILe model architecture
-- `generate_heatmap.py` — heatmap overlay (needs .tif adaptation)
+- `generate_heatmap.py` — heatmap overlay (needs .tif adaptation, currently expects .svs)
 - `feature_extraction.py` — embedding extraction pipeline
 - `superpixel_generation.py` — SLIC superpixel generation
 
-The upstream `generate_heatmap.py` expects `_inst.csv` result files with columns: `filename, prob, label, svs_name`. It uses `openslide.OpenSlide()` and creates RGBA overlays with `jet` colormap. For multiclass, this needs to be extended to show per-class colors instead of single probability heatmaps.
+Use the `single/` directory, NOT `multi/`. UBC-OCEAN is multiclass, not multilabel.
 
 ## Environment
 
@@ -194,18 +127,3 @@ The upstream `generate_heatmap.py` expects `_inst.csv` result files with columns
 - Key packages: openslide-python, scikit-image, scikit-learn, pandas, numpy, h5py, opencv-python, matplotlib, tqdm, pyyaml, tifffile, Pillow
 - For Conch encoder: timm, transformers, huggingface_hub
 - GPU: NVIDIA A100 (40GB) or similar
-
-## HuggingFace Resources
-
-- Pre-extracted embeddings (all 6 public datasets): `zeyugao/SMMILe_Datasets`
-- Spatial annotations: `zeyugao/SMMILe_SpatialAnnotation`
-- No pre-trained model weights are available — must train from scratch
-
-## Paper Performance Reference (UBC-OCEAN)
-
-| Metric | ResNet-50 | Conch |
-|---|---|---|
-| WSI AUC | 94.11% | 97.01% |
-| Spatial AUC | 94.40% | 96.67% |
-| Spatial F1 | 95.27% | 96.02% |
-| Spatial Accuracy | 91.83% | 92.98% |
