@@ -127,3 +127,19 @@ Use the `single/` directory, NOT `multi/`. UBC-OCEAN is multiclass, not multilab
 - Key packages: openslide-python, scikit-image, scikit-learn, pandas, numpy, h5py, opencv-python, matplotlib, tqdm, pyyaml, tifffile, Pillow
 - For Conch encoder: timm, transformers, huggingface_hub
 - GPU: NVIDIA A100 (40GB) or similar
+
+## Local + Colab Workflow
+
+Code and data live apart: **code** is version-controlled on GitHub, **data** lives on
+Google Drive and is never committed (`data/` and `results/` are gitignored).
+
+- **Local machine** — edit code, run CPU smoke tests, `git push`. Populate `data/` from
+  Drive with `gdown` (embeddings are large; `splits/`, `labels.csv` are tiny).
+- **Colab (A100)** — run `notebooks/colab_bootstrap.ipynb`: mount Drive → clone/`git pull`
+  code to `/content/SQ-MIL` (local disk, not Drive) → copy data Drive→disk once per session
+  (Drive FUSE reads are ~10× slower for many small `.npy`) → train with checkpoints written
+  back to `MyDrive/SQ-MIL/results/` so a disconnect never loses a finished fold.
+
+Editing loop: change code locally → `git push` → `git pull` on Colab → retrain. Code flows
+one-way GitHub → Colab; data only ever lives in Drive. Drive layout: `MyDrive/SQ-MIL/` with
+`labels.csv`, `splits/`, `ovarian_conch/{conch,sp_conch_n16_c50_512}/`, `results/`.

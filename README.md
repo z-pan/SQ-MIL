@@ -189,6 +189,57 @@ Output per WSI:
 
 ---
 
+## Local + Colab Dual Environment
+
+The workflow keeps **code** and **data** in separate homes:
+
+- **Code** → version-controlled on GitHub. Edited locally (agent/IDE), `git push`.
+- **Data** → Google Drive, **never committed** (`data/` and `results/` are gitignored).
+
+Code flows one-way GitHub → Colab (`git pull`); data only ever lives in Drive. Editing loop:
+change code locally → `git push` → `git pull` on Colab → retrain.
+
+Expected Drive layout (`MyDrive/SQ-MIL/`):
+
+```
+MyDrive/SQ-MIL/
+├── labels.csv
+├── splits/                        # splits_0.csv … splits_4.csv
+├── ovarian_conch/
+│   ├── conch/                     # patch embeddings (.npy)
+│   └── sp_conch_n16_c50_512/      # superpixel maps (.npy)
+├── ovarian_res50/                 # ResNet-50 embeddings (alt encoder)
+└── results/
+```
+
+### Colab (A100) — one-click
+
+Open [`notebooks/colab_bootstrap.ipynb`](notebooks/colab_bootstrap.ipynb) and run its 4 cells:
+
+1. Mount Drive.
+2. Clone/`git pull` code to Colab local disk (`/content/SQ-MIL`).
+3. Copy data Drive → local disk (training reads 513 small `.npy` per epoch; the Drive
+   FUSE mount is ~10× slower than local disk, so copy once per session).
+4. Train — checkpoints are written back to `MyDrive/SQ-MIL/results/`, so a disconnect
+   never loses a finished fold. Reconnect → rerun cells 1–3 → resume the unfinished fold
+   with `--fold N`.
+
+### Local machine — fetch data from Drive
+
+`data/` is gitignored, so populate it from your Drive `SQ-MIL/` folder. Embeddings are
+large; splits and labels are tiny:
+
+```bash
+pip install gdown
+# 5-fold split CSVs (from Drive SQ-MIL/splits/) → data/splits/
+mkdir -p data/splits && cd data/splits
+gdown --folder "https://drive.google.com/drive/folders/<your-splits-folder-id>"
+```
+
+Then run CPU smoke tests locally before pushing code that will train on the A100.
+
+---
+
 ## Directory Structure
 
 ```
@@ -241,7 +292,7 @@ SQ-MIL/
 - **WSI format**: All images must be `.tif`. Both pyramidal TIFF (OpenSlide) and flat TIFF (PIL/tifffile fallback) are supported.
 - **Embeddings**: Saved as `data/embeddings/{slide_id}/{x}_{y}_{patch_size}.npy` plus a `coords.csv` per slide.
 - **Labels**: `data/labels.csv` with columns `slide_id` (string, no extension) and `label` (int 0–4).
-- **Splits**: `data/splits/fold{k}_train.csv`, `fold{k}_val.csv`, `fold{k}_test.csv`.
+- **Splits**: `data/splits/splits_{k}.csv` (one per fold), each with three columns `train`, `val`, `test` holding slide IDs.
 
 ---
 
