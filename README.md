@@ -236,7 +236,18 @@ mkdir -p data/splits && cd data/splits
 gdown --folder "https://drive.google.com/drive/folders/<your-splits-folder-id>"
 ```
 
-Then run CPU smoke tests locally before pushing code that will train on the A100.
+Then run a CPU smoke test locally before pushing code that will train on the A100:
+
+```bash
+bash scripts/smoke_test.sh                 # Stage 1, fold 0: CPU, 1 epoch, 3 slides/split
+bash scripts/smoke_test.sh --stage 2 --config configs/ovarian_conch_s2.yaml
+```
+
+Equivalently, `python scripts/train.py --config <cfg> --stage 1 --fold 0 --fast_dev_run`.
+It exercises the full path (config → data loading → model → loss → checkpoint) in
+seconds, writing throwaway artifacts to `results/_smoke/`, and catches shape/path/dtype
+bugs before they cost A100 time. Needs local `data/` and `pip install -r requirements.txt`;
+no GPU required.
 
 ---
 

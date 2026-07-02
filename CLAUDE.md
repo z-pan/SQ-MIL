@@ -134,7 +134,10 @@ Code and data live apart: **code** is version-controlled on GitHub, **data** liv
 Google Drive and is never committed (`data/` and `results/` are gitignored).
 
 - **Local machine** — edit code, run CPU smoke tests, `git push`. Populate `data/` from
-  Drive with `gdown` (embeddings are large; `splits/`, `labels.csv` are tiny).
+  Drive with `gdown` (embeddings are large; `splits/`, `labels.csv` are tiny). Before
+  pushing, run `bash scripts/smoke_test.sh` (= `train.py --fast_dev_run`): CPU, 1 epoch,
+  a few slides per split, artifacts to `results/_smoke/`. Catches shape/path/dtype bugs
+  in seconds without touching a GPU.
 - **Colab (A100)** — run `notebooks/colab_bootstrap.ipynb`: mount Drive → clone/`git pull`
   code to `/content/SQ-MIL` (local disk, not Drive) → copy data Drive→disk once per session
   (Drive FUSE reads are ~10× slower for many small `.npy`) → train with checkpoints written

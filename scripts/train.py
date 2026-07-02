@@ -163,6 +163,13 @@ def make_loader(
         augment        = augment,
     )
 
+    # Smoke test: keep only the first few slides of each split.
+    limit = cfg.get("_smoke_limit")
+    if limit:
+        from torch.utils.data import Subset
+        n = min(int(limit), len(dataset))
+        dataset = Subset(dataset, list(range(n)))
+
     sampler = None
     shuffle = False
     if weighted_sampling and split == "train":
@@ -249,7 +256,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed",        type=int, default=None,
                    help="Override random seed (default: from config experiment.seed).")
 
+    # Smoke test
+    p.add_argument("--fast_dev_run", action="store_true",
+                   help="Smoke test: force CPU, 1 epoch, a few slides per split, "
+                        "throwaway output dir (results/_smoke). Catches shape/path/"
+                        "dtype bugs in seconds before pushing / burning A100 time.")
+    p.add_argument("--limit_slides", type=int, default=3,
+                   help="With --fast_dev_run, number of slides per split.")
+
     return p.parse_args()
+
+
+def apply_smoke(cfg: dict, args: argparse.Namespace) -> dict:
+    """Shrink the run to a CPU-friendly smoke test (see --fast_dev_run)."""
+    hw = cfg.setdefault("hardware", {})
+    tr = cfg.setdefault("training", {})
+    hw["gpu_id"]           = -1        # force CPU
+    hw["num_workers"]      = 0         # avoid Windows multiprocessing overhead
+    hw["pin_memory"]       = False
+    tr["epochs"]           = 1
+    tr["weighted_sampling"] = False    # Subset breaks the class-balanced sampler
+    cfg["_smoke_limit"]    = max(1, args.limit_slides)
+    if not args.output_dir:            # keep smoke artifacts out of real results/
+        cfg.setdefault("paths", {})["output_dir"] = "results/_smoke"
+    return cfg
 
 
 def run_fold(cfg: dict, fold_idx: int, args: argparse.Namespace) -> dict | None:
@@ -325,6 +355,8 @@ def main() -> None:
     args = parse_args()
     cfg  = load_config(args.config)
     cfg  = apply_overrides(cfg, args)
+    if args.fast_dev_run:
+        cfg = apply_smoke(cfg, args)
 
     n_folds = cfg.get("dataset", {}).get("n_folds", 5)
 
