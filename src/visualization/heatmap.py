@@ -200,20 +200,30 @@ class HeatmapGenerator:
         # ---- Infer patch size (majority value, fallback 512) -------------
         patch_size = int(preds["patch_size"].mode().iloc[0]) if "patch_size" in preds.columns else 512
 
-        # ---- Build overlay: attention (preferred) or class-prediction ----
-        attn_result = self._build_attention_overlay(
+        # ---- Build overlay: sparse subtype segmentation (preferred, matches
+        #      the SMMILe paper) → attention → dense class map (fallbacks) ----
+        attn_class = None
+        seg_area = None
+        seg_result = self._build_segmentation_overlay(
             preds, thumb_arr, scale_x, scale_y, patch_size
         )
-        if attn_result is not None:
-            overlay_rgb, attn_class = attn_result
-            use_attention = True
-            panel2_title = f"Attention ({attn_class})"
+        if seg_result is not None:
+            overlay_rgb, seg_area = seg_result
+            mode = "seg"
+            panel2_title = "Predicted subtype regions"
         else:
-            prob_maps = self._build_prob_maps(preds, thumb_w, thumb_h, scale_x, scale_y, patch_size)
-            overlay_rgb = self._blend_overlay(thumb_arr, prob_maps)
-            use_attention = False
-            attn_class = None
-            panel2_title = "Spatial Prediction"
+            attn_result = self._build_attention_overlay(
+                preds, thumb_arr, scale_x, scale_y, patch_size
+            )
+            if attn_result is not None:
+                overlay_rgb, attn_class = attn_result
+                mode = "attn"
+                panel2_title = f"Attention ({attn_class})"
+            else:
+                prob_maps = self._build_prob_maps(preds, thumb_w, thumb_h, scale_x, scale_y, patch_size)
+                overlay_rgb = self._blend_overlay(thumb_arr, prob_maps)
+                mode = "class"
+                panel2_title = "Spatial Prediction"
 
         gt_overlay_rgb: np.ndarray | None = None
         if show_gt and gt_df is not None:
@@ -254,15 +264,22 @@ class HeatmapGenerator:
             axes[2].set_title("Ground Truth", fontsize=11, pad=4)
             axes[2].axis("off")
 
-        # Figure title
-        if use_attention:
+        # Figure title — use the WSI-level (bag) prediction when available.
+        wsi_disp = (
+            str(preds["bag_pred_class"].iloc[0])
+            if "bag_pred_class" in preds.columns and len(preds)
+            else pred_name
+        )
+        if mode == "attn":
             title = f"{slide_id}  |  Attention heatmap — predicted {attn_class} ({wsi_conf * 100:.1f}%)"
+        elif mode == "seg":
+            title = f"{slide_id}  |  Predicted subtype: {wsi_disp}"
         else:
             title = f"{slide_id}  |  Predicted: {pred_name} ({wsi_conf * 100:.1f}%)"
         fig.suptitle(title, fontsize=13, fontweight="bold", y=0.98)
 
         # Bottom legend
-        if use_attention:
+        if mode == "attn":
             import matplotlib.cm as cm
             cmap = cm.get_cmap("jet")
             legend_handles = [
@@ -275,16 +292,19 @@ class HeatmapGenerator:
                 title="Attention (for predicted subtype)",
             )
         else:
-            # per-class color + name + mean confidence
+            # per-class color + name; show foreground-area % (seg) or mean conf (class)
             legend_handles = []
             for cls_idx in range(self.n_classes):
                 color_rgb  = self.subtype_colors.get(cls_idx, (128, 128, 128))
                 color_mpl  = tuple(c / 255.0 for c in color_rgb)
                 name       = SUBTYPE_NAMES.get(cls_idx, str(cls_idx))
-                conf_pct   = mean_probs[cls_idx] * 100 if cls_idx < len(mean_probs) else 0.0
-                legend_handles.append(
-                    mpatches.Patch(color=color_mpl, label=f"{name}: {conf_pct:.1f}%")
-                )
+                if mode == "seg" and seg_area is not None:
+                    pct = seg_area[cls_idx] * 100 if cls_idx < len(seg_area) else 0.0
+                    label = f"{name}: {pct:.0f}% area"
+                else:
+                    conf_pct = mean_probs[cls_idx] * 100 if cls_idx < len(mean_probs) else 0.0
+                    label = f"{name}: {conf_pct:.1f}%"
+                legend_handles.append(mpatches.Patch(color=color_mpl, label=label))
             fig.legend(
                 handles     = legend_handles,
                 loc         = "lower center",
@@ -565,6 +585,76 @@ class HeatmapGenerator:
         blended = thumb_f * (1.0 - eff_alpha) + color_layer * eff_alpha
         blended = np.clip(blended * 255.0, 0, 255).astype(np.uint8)
         return blended
+
+    def _build_segmentation_overlay(
+        self,
+        preds: pd.DataFrame,
+        thumbnail: np.ndarray,
+        scale_x: float,
+        scale_y: float,
+        patch_size: int,
+    ):
+        """Sparse instance-segmentation overlay (matches SMMILe paper Fig. 5).
+
+        SMMILe's refinement classifies each patch into a subtype **or a
+        background/negative class**. Only foreground (``is_background == 0``)
+        patches are colored, by predicted subtype; background patches stay as
+        tissue. A heavy Gaussian blur merges the patch squares into coherent,
+        morphology-scale regions rather than a checkerboard. Returns
+        ``(overlay_rgb, area_fractions)`` or ``None`` when ``is_background`` is
+        absent (older CSVs) or no foreground patches exist.
+        """
+        if "is_background" not in preds.columns:
+            return None
+
+        thumb_h, thumb_w = thumbnail.shape[:2]
+        ps_x = max(1, int(patch_size * scale_x))
+        ps_y = max(1, int(patch_size * scale_y))
+        xs = (preds["x"].values * scale_x).astype(np.int32)
+        ys = (preds["y"].values * scale_y).astype(np.int32)
+        is_bg = pd.to_numeric(preds["is_background"], errors="coerce").fillna(0).values.astype(int)
+        cls   = preds["pred_class_int"].values.astype(int)
+
+        color_map = np.zeros((thumb_h, thumb_w, 3), dtype=np.float32)
+        alpha_map = np.zeros((thumb_h, thumb_w), dtype=np.float32)
+        counts = np.zeros(self.n_classes, dtype=np.int64)
+        for i in range(len(preds)):
+            if is_bg[i]:
+                continue
+            x0, y0 = int(xs[i]), int(ys[i])
+            x1, y1 = min(thumb_w, x0 + ps_x), min(thumb_h, y0 + ps_y)
+            if x0 >= thumb_w or y0 >= thumb_h or x1 <= 0 or y1 <= 0:
+                continue
+            c = int(cls[i])
+            color = np.array(self.subtype_colors.get(c, (128, 128, 128)), dtype=np.float32) / 255.0
+            color_map[y0:y1, x0:x1] = color
+            alpha_map[y0:y1, x0:x1] = 1.0
+            if 0 <= c < self.n_classes:
+                counts[c] += 1
+        if counts.sum() == 0:
+            return None
+
+        # Heavy blur → coherent regions (upstream uses a 151px kernel on the
+        # downsampled WSI). Normalised convolution keeps region colors saturated.
+        sigma = max(ps_x, ps_y) * 1.5
+        color_s = np.stack(
+            [gaussian_filter(color_map[..., ch], sigma=sigma) for ch in range(3)], axis=-1
+        )
+        alpha_s = gaussian_filter(alpha_map, sigma=sigma)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            norm_color = np.where(
+                alpha_s[:, :, None] > 1e-3, color_s / np.maximum(alpha_s[:, :, None], 1e-3), 0.0
+            )
+        # Alpha: strong in region cores (gamma < 1), soft at region edges, so
+        # subtype colors read clearly against the H&E background.
+        cov = np.clip(alpha_s, 0.0, 1.0)
+        a = ((cov ** 0.7) * 0.7)[:, :, None]
+        thumb_f = thumbnail.astype(np.float32) / 255.0
+        blended = thumb_f * (1.0 - a) + norm_color * a
+        overlay_rgb = np.clip(blended * 255.0, 0, 255).astype(np.uint8)
+
+        area = counts / counts.sum()
+        return overlay_rgb, area
 
     def _build_attention_overlay(
         self,

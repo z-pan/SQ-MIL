@@ -227,6 +227,17 @@ class SMMILeTrainer:
             patch_labels = np.full(len(patch_preds), label)  # all patches = WSI label
             evaluator.update_patch(patch_probs, patch_labels)
 
+            # ---- Foreground / background (sparse instance seg) -----------
+            # The full refinement has a trailing negative/background class
+            # (index n_classes). SMMILe is sparse: most patches are background
+            # and must NOT be colored in the heatmap, so tumor-subtype regions
+            # stand out as coherent areas (matches upstream demo.py).
+            if use_refinement and "ref_logits" in out:
+                ref_full_pred = ref_logits.argmax(dim=-1).cpu().numpy()  # (K,) in 0..C
+                is_bg = (ref_full_pred == n_classes).astype(int)
+            else:
+                is_bg = np.zeros(len(patch_preds), dtype=int)
+
             # ---- Instance CSV rows ---------------------------------------
             for k in range(len(patch_preds)):
                 row: dict = {
@@ -235,6 +246,7 @@ class SMMILeTrainer:
                     "y":              int(coords[k, 1]),
                     "predicted_class": CLASS_NAMES[patch_preds[k]],
                     "bag_pred_class":  CLASS_NAMES[bag_pred_idx],
+                    "is_background":   int(is_bg[k]),
                 }
                 for ci, col in enumerate(class_cols):
                     row[col] = float(patch_probs[k, ci])
