@@ -200,9 +200,20 @@ class HeatmapGenerator:
         # ---- Infer patch size (majority value, fallback 512) -------------
         patch_size = int(preds["patch_size"].mode().iloc[0]) if "patch_size" in preds.columns else 512
 
-        # ---- Build overlays ---------------------------------------------
-        prob_maps = self._build_prob_maps(preds, thumb_w, thumb_h, scale_x, scale_y, patch_size)
-        overlay_rgb = self._blend_overlay(thumb_arr, prob_maps)
+        # ---- Build overlay: attention (preferred) or class-prediction ----
+        attn_result = self._build_attention_overlay(
+            preds, thumb_arr, scale_x, scale_y, patch_size
+        )
+        if attn_result is not None:
+            overlay_rgb, attn_class = attn_result
+            use_attention = True
+            panel2_title = f"Attention ({attn_class})"
+        else:
+            prob_maps = self._build_prob_maps(preds, thumb_w, thumb_h, scale_x, scale_y, patch_size)
+            overlay_rgb = self._blend_overlay(thumb_arr, prob_maps)
+            use_attention = False
+            attn_class = None
+            panel2_title = "Spatial Prediction"
 
         gt_overlay_rgb: np.ndarray | None = None
         if show_gt and gt_df is not None:
@@ -232,9 +243,9 @@ class HeatmapGenerator:
         axes[0].set_title("Original WSI", fontsize=11, pad=4)
         axes[0].axis("off")
 
-        # Panel 2: spatial prediction overlay
+        # Panel 2: spatial prediction / attention overlay
         axes[1].imshow(overlay_rgb, interpolation="nearest")
-        axes[1].set_title("Spatial Prediction", fontsize=11, pad=4)
+        axes[1].set_title(panel2_title, fontsize=11, pad=4)
         axes[1].axis("off")
 
         # Panel 3 (optional): ground-truth overlay
@@ -244,31 +255,44 @@ class HeatmapGenerator:
             axes[2].axis("off")
 
         # Figure title
-        fig.suptitle(
-            f"{slide_id}  |  Predicted: {pred_name} ({wsi_conf * 100:.1f}%)",
-            fontsize=13,
-            fontweight="bold",
-            y=0.98,
-        )
+        if use_attention:
+            title = f"{slide_id}  |  Attention heatmap — predicted {attn_class} ({wsi_conf * 100:.1f}%)"
+        else:
+            title = f"{slide_id}  |  Predicted: {pred_name} ({wsi_conf * 100:.1f}%)"
+        fig.suptitle(title, fontsize=13, fontweight="bold", y=0.98)
 
-        # Bottom legend — per-class color + name + mean confidence
-        legend_handles = []
-        for cls_idx in range(self.n_classes):
-            color_rgb  = self.subtype_colors.get(cls_idx, (128, 128, 128))
-            color_mpl  = tuple(c / 255.0 for c in color_rgb)
-            name       = SUBTYPE_NAMES.get(cls_idx, str(cls_idx))
-            conf_pct   = mean_probs[cls_idx] * 100 if cls_idx < len(mean_probs) else 0.0
-            legend_handles.append(
-                mpatches.Patch(color=color_mpl, label=f"{name}: {conf_pct:.1f}%")
+        # Bottom legend
+        if use_attention:
+            import matplotlib.cm as cm
+            cmap = cm.get_cmap("jet")
+            legend_handles = [
+                mpatches.Patch(color=cmap(v), label=lab)
+                for v, lab in [(0.05, "low"), (0.5, "medium"), (0.95, "high")]
+            ]
+            fig.legend(
+                handles=legend_handles, loc="lower center", ncol=3, fontsize=10,
+                framealpha=0.9, bbox_to_anchor=(0.5, 0.005),
+                title="Attention (for predicted subtype)",
             )
-        fig.legend(
-            handles     = legend_handles,
-            loc         = "lower center",
-            ncol        = self.n_classes,
-            fontsize    = 10,
-            framealpha  = 0.9,
-            bbox_to_anchor = (0.5, 0.005),
-        )
+        else:
+            # per-class color + name + mean confidence
+            legend_handles = []
+            for cls_idx in range(self.n_classes):
+                color_rgb  = self.subtype_colors.get(cls_idx, (128, 128, 128))
+                color_mpl  = tuple(c / 255.0 for c in color_rgb)
+                name       = SUBTYPE_NAMES.get(cls_idx, str(cls_idx))
+                conf_pct   = mean_probs[cls_idx] * 100 if cls_idx < len(mean_probs) else 0.0
+                legend_handles.append(
+                    mpatches.Patch(color=color_mpl, label=f"{name}: {conf_pct:.1f}%")
+                )
+            fig.legend(
+                handles     = legend_handles,
+                loc         = "lower center",
+                ncol        = self.n_classes,
+                fontsize    = 10,
+                framealpha  = 0.9,
+                bbox_to_anchor = (0.5, 0.005),
+            )
 
         plt.subplots_adjust(top=0.91, bottom=0.08, left=0.01, right=0.99, wspace=0.03)
         fig.savefig(str(output_path), dpi=dpi, bbox_inches="tight")
@@ -541,6 +565,81 @@ class HeatmapGenerator:
         blended = thumb_f * (1.0 - eff_alpha) + color_layer * eff_alpha
         blended = np.clip(blended * 255.0, 0, 255).astype(np.uint8)
         return blended
+
+    def _build_attention_overlay(
+        self,
+        preds: pd.DataFrame,
+        thumbnail: np.ndarray,
+        scale_x: float,
+        scale_y: float,
+        patch_size: int,
+    ):
+        """Build a smooth attention heatmap overlay for the WSI-predicted class.
+
+        Uses the per-instance attention weights (``attn_<CLASS>`` columns saved by
+        the trainer). Attention is highly concentrated on discriminative patches,
+        so this shows *where the model looks* — unlike per-patch class confidence,
+        which is near-uniform. Returns ``(overlay_rgb, class_name)`` or ``None``
+        when attention columns are absent.
+        """
+        # WSI-level predicted subtype drives which attention map to show.
+        if "bag_pred_class" not in preds.columns or len(preds) == 0:
+            return None
+        cls_name = str(preds["bag_pred_class"].iloc[0])
+        attn_col = f"attn_{cls_name}"
+        if attn_col not in preds.columns:
+            return None
+
+        import matplotlib.cm as cm
+
+        thumb_h, thumb_w = thumbnail.shape[:2]
+        ps_x = max(1, int(patch_size * scale_x))
+        ps_y = max(1, int(patch_size * scale_y))
+        xs = (preds["x"].values * scale_x).astype(np.int32)
+        ys = (preds["y"].values * scale_y).astype(np.int32)
+        vals = pd.to_numeric(preds[attn_col], errors="coerce").fillna(0.0).values.astype(np.float32)
+
+        # Paint each patch's attention into its thumbnail rectangle (mean over overlaps).
+        acc = np.zeros((thumb_h, thumb_w), dtype=np.float32)
+        cnt = np.zeros((thumb_h, thumb_w), dtype=np.float32)
+        for i in range(len(preds)):
+            x0, y0 = int(xs[i]), int(ys[i])
+            x1, y1 = min(thumb_w, x0 + ps_x), min(thumb_h, y0 + ps_y)
+            if x0 >= thumb_w or y0 >= thumb_h or x1 <= 0 or y1 <= 0:
+                continue
+            acc[y0:y1, x0:x1] += vals[i]
+            cnt[y0:y1, x0:x1] += 1.0
+        tissue = cnt > 0
+
+        # Normalised-convolution smoothing: blur value and coverage, then divide,
+        # so patch blocks merge into coherent regions without edge dimming.
+        sigma = max(self.gaussian_sigma, ps_x * 1.2, ps_y * 1.2)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            val0 = np.where(tissue, acc / np.maximum(cnt, 1.0), 0.0)
+            val_s = gaussian_filter(val0, sigma=sigma)
+            cov_s = gaussian_filter(tissue.astype(np.float32), sigma=sigma)
+            field = np.where(cov_s > 1e-3, val_s / np.maximum(cov_s, 1e-3), 0.0)
+
+        # Normalise to [0, 1] by a high percentile of tissue values (robust to
+        # a few extreme patches), then gamma-boost mid-tones for visibility.
+        tv = field[tissue]
+        hi = float(np.percentile(tv, 99.0)) if tv.size else 0.0
+        if hi <= 0:
+            hi = float(field.max()) or 1.0
+        norm = np.clip(field / (hi + 1e-8), 0.0, 1.0) ** 0.6
+        # Confine the overlay to tissue: a soft coverage ramp prevents the
+        # normalised-convolution division from blooming hot blobs past the
+        # tissue edge into the background.
+        tissue_w = np.clip((cov_s - 0.2) / 0.3, 0.0, 1.0)
+        norm = norm * tissue_w
+
+        # Composite jet colormap onto the tissue; alpha = attention (cold → tissue).
+        colored = cm.get_cmap("jet")(norm)[:, :, :3].astype(np.float32)
+        thumb_f = thumbnail.astype(np.float32) / 255.0
+        alpha = (norm * 0.85)[:, :, None]
+        blended = thumb_f * (1.0 - alpha) + colored * alpha
+        overlay_rgb = np.clip(blended * 255.0, 0, 255).astype(np.uint8)
+        return overlay_rgb, cls_name
 
     def _wsi_level_prediction(
         self,

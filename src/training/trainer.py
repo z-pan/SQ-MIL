@@ -204,6 +204,14 @@ class SMMILeTrainer:
             # ---- WSI-level bag prediction --------------------------------
             bag_probs = F.softmax(out["bag_logits"], dim=-1).cpu().numpy()
             evaluator.update_wsi(slide_id, bag_probs, label)
+            bag_pred_idx = int(bag_probs.argmax())
+
+            # ---- Per-instance attention weights (for heatmaps) -----------
+            # out["attn"] is (C, K): softmax attention over the K instances for
+            # each class. Saved so heatmaps can show *where the model attends*
+            # (concentrated on discriminative patches) rather than only the
+            # near-uniform per-patch class confidence.
+            attn = out["attn"].detach().cpu().numpy()        # (C, K)
 
             # ---- Patch-level predictions ---------------------------------
             if use_refinement and "ref_logits" in out:
@@ -226,9 +234,12 @@ class SMMILeTrainer:
                     "x":              int(coords[k, 0]),
                     "y":              int(coords[k, 1]),
                     "predicted_class": CLASS_NAMES[patch_preds[k]],
+                    "bag_pred_class":  CLASS_NAMES[bag_pred_idx],
                 }
                 for ci, col in enumerate(class_cols):
                     row[col] = float(patch_probs[k, ci])
+                for ci, cls in enumerate(CLASS_NAMES[:n_classes]):
+                    row[f"attn_{cls}"] = float(attn[ci, k])
                 inst_rows.append(row)
 
         # ---- Compute metrics --------------------------------------------
