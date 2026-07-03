@@ -200,132 +200,33 @@ class HeatmapGenerator:
         # ---- Infer patch size (majority value, fallback 512) -------------
         patch_size = int(preds["patch_size"].mode().iloc[0]) if "patch_size" in preds.columns else 512
 
-        # ---- Build overlay. Preferred: single-subtype probability heatmap
-        #      (consistent across slides). Fallbacks: sparse segmentation →
-        #      attention → dense class map. ---------------------------------
+        # ---- Build the overlay. Default: blocky subtype patch mask (matches
+        #      SMMILe paper Fig. 5 — discrete tumor patches). Fallbacks:
+        #      probability → attention → dense class map, used only when the
+        #      segmentation columns are missing. ------------------------------
         subtype_class = None
         seg_area = None
-        prob_result = self._build_subtype_prob_overlay(
+        seg_result = self._build_segmentation_overlay(
             preds, thumb_arr, scale_x, scale_y, patch_size
         )
-        if prob_result is not None:
-            overlay_rgb, subtype_class = prob_result
-            mode = "prob"
-            panel2_title = f"{subtype_class} probability"
-        elif (seg_result := self._build_segmentation_overlay(
-                preds, thumb_arr, scale_x, scale_y, patch_size)) is not None:
+        if seg_result is not None:
             overlay_rgb, seg_area = seg_result
             mode = "seg"
-            panel2_title = "Predicted subtype regions"
+        elif (prob_result := self._build_subtype_prob_overlay(
+                preds, thumb_arr, scale_x, scale_y, patch_size)) is not None:
+            overlay_rgb, subtype_class = prob_result
+            mode = "prob"
         elif (attn_result := self._build_attention_overlay(
                 preds, thumb_arr, scale_x, scale_y, patch_size)) is not None:
             overlay_rgb, subtype_class = attn_result
             mode = "attn"
-            panel2_title = f"Attention ({subtype_class})"
         else:
             prob_maps = self._build_prob_maps(preds, thumb_w, thumb_h, scale_x, scale_y, patch_size)
             overlay_rgb = self._blend_overlay(thumb_arr, prob_maps)
             mode = "class"
-            panel2_title = "Spatial Prediction"
 
-        gt_overlay_rgb: np.ndarray | None = None
-        if show_gt and gt_df is not None:
-            gt_preds   = self._normalize_df(gt_df)
-            gt_prob_maps = self._build_prob_maps(gt_preds, thumb_w, thumb_h, scale_x, scale_y, patch_size)
-            gt_overlay_rgb = self._blend_overlay(thumb_arr, gt_prob_maps)
-
-        # ---- WSI-level prediction from mean patch probabilities ---------
-        wsi_pred, wsi_conf, mean_probs = self._wsi_level_prediction(preds)
-        pred_name = SUBTYPE_NAMES.get(wsi_pred, str(wsi_pred))
-
-        # ---- Compose matplotlib figure ----------------------------------
-        n_panels  = 2 + (1 if gt_overlay_rgb is not None else 0)
-        dpi       = 100
-        # Reserve 80px at bottom for legend + 50px at top for title
-        fig_w_in  = (thumb_w * n_panels) / dpi
-        fig_h_in  = (thumb_h + 130) / dpi
-
-        fig, axes = plt.subplots(1, n_panels, figsize=(fig_w_in, fig_h_in), dpi=dpi)
-        if n_panels == 2:
-            axes = list(axes)
-        else:
-            axes = list(axes)
-
-        # Panel 1: original thumbnail
-        axes[0].imshow(thumb_arr, interpolation="nearest")
-        axes[0].set_title("Original WSI", fontsize=11, pad=4)
-        axes[0].axis("off")
-
-        # Panel 2: spatial prediction / attention overlay
-        axes[1].imshow(overlay_rgb, interpolation="nearest")
-        axes[1].set_title(panel2_title, fontsize=11, pad=4)
-        axes[1].axis("off")
-
-        # Panel 3 (optional): ground-truth overlay
-        if gt_overlay_rgb is not None:
-            axes[2].imshow(gt_overlay_rgb, interpolation="nearest")
-            axes[2].set_title("Ground Truth", fontsize=11, pad=4)
-            axes[2].axis("off")
-
-        # Figure title — use the WSI-level (bag) prediction when available.
-        wsi_disp = (
-            str(preds["bag_pred_class"].iloc[0])
-            if "bag_pred_class" in preds.columns and len(preds)
-            else pred_name
-        )
-        if mode == "prob":
-            title = f"{slide_id}  |  Predicted: {subtype_class} — spatial probability"
-        elif mode == "attn":
-            title = f"{slide_id}  |  Attention heatmap — predicted {subtype_class} ({wsi_conf * 100:.1f}%)"
-        elif mode == "seg":
-            title = f"{slide_id}  |  Predicted subtype: {wsi_disp}"
-        else:
-            title = f"{slide_id}  |  Predicted: {pred_name} ({wsi_conf * 100:.1f}%)"
-        fig.suptitle(title, fontsize=13, fontweight="bold", y=0.98)
-
-        # Bottom legend
-        if mode in ("prob", "attn"):
-            import matplotlib.cm as cm
-            cmap = cm.get_cmap("jet")
-            legend_handles = [
-                mpatches.Patch(color=cmap(v), label=lab)
-                for v, lab in [(0.05, "low"), (0.5, "medium"), (0.95, "high")]
-            ]
-            leg_title = (
-                f"P({subtype_class}) — low → high"
-                if mode == "prob" else "Attention (for predicted subtype)"
-            )
-            fig.legend(
-                handles=legend_handles, loc="lower center", ncol=3, fontsize=10,
-                framealpha=0.9, bbox_to_anchor=(0.5, 0.005), title=leg_title,
-            )
-        else:
-            # per-class color + name; show foreground-area % (seg) or mean conf (class)
-            legend_handles = []
-            for cls_idx in range(self.n_classes):
-                color_rgb  = self.subtype_colors.get(cls_idx, (128, 128, 128))
-                color_mpl  = tuple(c / 255.0 for c in color_rgb)
-                name       = SUBTYPE_NAMES.get(cls_idx, str(cls_idx))
-                if mode == "seg" and seg_area is not None:
-                    pct = seg_area[cls_idx] * 100 if cls_idx < len(seg_area) else 0.0
-                    label = f"{name}: {pct:.0f}% area"
-                else:
-                    conf_pct = mean_probs[cls_idx] * 100 if cls_idx < len(mean_probs) else 0.0
-                    label = f"{name}: {conf_pct:.1f}%"
-                legend_handles.append(mpatches.Patch(color=color_mpl, label=label))
-            fig.legend(
-                handles     = legend_handles,
-                loc         = "lower center",
-                ncol        = self.n_classes,
-                fontsize    = 10,
-                framealpha  = 0.9,
-                bbox_to_anchor = (0.5, 0.005),
-            )
-
-        plt.subplots_adjust(top=0.91, bottom=0.08, left=0.01, right=0.99, wspace=0.03)
-        fig.savefig(str(output_path), dpi=dpi, bbox_inches="tight")
-        plt.close(fig)
-
+        # ---- Save the overlay image directly (single image, no side-by-side) -
+        Image.fromarray(overlay_rgb).save(str(output_path))
         logger.info("Saved heatmap → %s", output_path)
         return output_path
 
@@ -700,6 +601,12 @@ class HeatmapGenerator:
         is_bg = pd.to_numeric(preds["is_background"], errors="coerce").fillna(0).values.astype(int)
         cls   = preds["pred_class_int"].values.astype(int)
 
+        # Color every foreground (tumor) patch with the WSI-predicted subtype's
+        # single color — one color per slide, so the tumor-area mask is clean
+        # and consistent instead of a per-patch rainbow.
+        bag_idx = None
+        if "bag_pred_class" in preds.columns and len(preds):
+            bag_idx = _NAME_TO_IDX.get(str(preds["bag_pred_class"].iloc[0]))
         color_map = np.zeros((thumb_h, thumb_w, 3), dtype=np.float32)
         alpha_map = np.zeros((thumb_h, thumb_w), dtype=np.float32)
         counts = np.zeros(self.n_classes, dtype=np.int64)
@@ -710,7 +617,7 @@ class HeatmapGenerator:
             x1, y1 = min(thumb_w, x0 + ps_x), min(thumb_h, y0 + ps_y)
             if x0 >= thumb_w or y0 >= thumb_h or x1 <= 0 or y1 <= 0:
                 continue
-            c = int(cls[i])
+            c = bag_idx if bag_idx is not None else int(cls[i])
             color = np.array(self.subtype_colors.get(c, (128, 128, 128)), dtype=np.float32) / 255.0
             color_map[y0:y1, x0:x1] = color
             alpha_map[y0:y1, x0:x1] = 1.0
@@ -719,23 +626,13 @@ class HeatmapGenerator:
         if counts.sum() == 0:
             return None
 
-        # Heavy blur → coherent regions (upstream uses a 151px kernel on the
-        # downsampled WSI). Normalised convolution keeps region colors saturated.
-        sigma = max(ps_x, ps_y) * 1.5
-        color_s = np.stack(
-            [gaussian_filter(color_map[..., ch], sigma=sigma) for ch in range(3)], axis=-1
-        )
-        alpha_s = gaussian_filter(alpha_map, sigma=sigma)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            norm_color = np.where(
-                alpha_s[:, :, None] > 1e-3, color_s / np.maximum(alpha_s[:, :, None], 1e-3), 0.0
-            )
-        # Alpha: strong in region cores (gamma < 1), soft at region edges, so
-        # subtype colors read clearly against the H&E background.
-        cov = np.clip(alpha_s, 0.0, 1.0)
-        a = ((cov ** 0.7) * 0.7)[:, :, None]
+        # Blocky patch mask (matches SMMILe paper Fig. 5): keep the discrete
+        # patch squares — NO region-merging blur. ``color_map`` already holds
+        # each foreground patch's subtype color; ``alpha_map`` marks painted
+        # (tumor) pixels. Semi-transparent so the H&E tissue shows through.
+        a = (np.clip(alpha_map, 0.0, 1.0) * 0.5)[:, :, None]
         thumb_f = thumbnail.astype(np.float32) / 255.0
-        blended = thumb_f * (1.0 - a) + norm_color * a
+        blended = thumb_f * (1.0 - a) + color_map * a
         overlay_rgb = np.clip(blended * 255.0, 0, 255).astype(np.uint8)
 
         area = counts / counts.sum()
