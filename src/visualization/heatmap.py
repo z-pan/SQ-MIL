@@ -169,7 +169,6 @@ class HeatmapGenerator:
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
 
-        wsi_path    = Path(wsi_path)
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
