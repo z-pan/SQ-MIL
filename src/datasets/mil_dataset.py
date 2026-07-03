@@ -138,6 +138,31 @@ def _extract_from_object(arr: np.ndarray, preferred_keys: tuple[str, ...]) -> np
     raise TypeError(f"Cannot extract ndarray from {type(obj).__name__}")
 
 
+def _parse_string_coords(val) -> np.ndarray | None:
+    """Parse a sequence of ``'x_y[_size]'`` patch keys into an ``(N, 2)`` int array.
+
+    HuggingFace-style pre-extracted embeddings store patch positions as string
+    keys in an ``index`` field, e.g. ``'15360_10752_512'`` = ``x_y_patchsize``.
+    Returns None when *val* is not such a sequence of strings.
+    """
+    if isinstance(val, np.ndarray):
+        val = val.tolist()
+    if not isinstance(val, (list, tuple)) or len(val) == 0:
+        return None
+    if not isinstance(val[0], (str, bytes, np.str_)):
+        return None
+    out: list[tuple[int, int]] = []
+    for s in val:
+        parts = str(s).split("_")
+        if len(parts) < 2:
+            return None
+        try:
+            out.append((int(parts[0]), int(parts[1])))
+        except ValueError:
+            return None
+    return np.array(out, dtype=np.int64)
+
+
 def _extract_coords_from_object(arr: np.ndarray) -> np.ndarray | None:
     """Try to extract a coordinate array from an object-dtype dict; return None if absent."""
     obj = arr.item() if arr.shape == () else arr
@@ -145,9 +170,14 @@ def _extract_coords_from_object(arr: np.ndarray) -> np.ndarray | None:
         return None
     for key in _COORD_KEYS:
         if key in obj:
+            # Numeric (N, 2+) coordinate array.
             c = _to_ndarray(obj[key])
             if c is not None and c.ndim == 2 and c.shape[1] >= 2:
                 return c[:, :2].astype(np.int64)
+            # String 'x_y_size' patch keys (HuggingFace 'index' field).
+            parsed = _parse_string_coords(obj[key])
+            if parsed is not None:
+                return parsed
     return None
 
 

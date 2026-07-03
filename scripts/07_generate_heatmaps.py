@@ -238,7 +238,8 @@ def main() -> None:
         # Filter to this slide if the CSV has slide_id column
         import pandas as pd
         if "slide_id" in single_pred_df.columns:
-            slide_df = single_pred_df[single_pred_df["slide_id"] == slide_id]
+            # Compare as strings: CSV slide_id may be int while the WSI stem is str.
+            slide_df = single_pred_df[single_pred_df["slide_id"].astype(str) == str(slide_id)]
             if slide_df.empty:
                 # Try all rows (user may have passed a single-slide CSV)
                 slide_df = single_pred_df
