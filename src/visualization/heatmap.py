@@ -200,30 +200,33 @@ class HeatmapGenerator:
         # ---- Infer patch size (majority value, fallback 512) -------------
         patch_size = int(preds["patch_size"].mode().iloc[0]) if "patch_size" in preds.columns else 512
 
-        # ---- Build overlay: sparse subtype segmentation (preferred, matches
-        #      the SMMILe paper) → attention → dense class map (fallbacks) ----
-        attn_class = None
+        # ---- Build overlay. Preferred: single-subtype probability heatmap
+        #      (consistent across slides). Fallbacks: sparse segmentation →
+        #      attention → dense class map. ---------------------------------
+        subtype_class = None
         seg_area = None
-        seg_result = self._build_segmentation_overlay(
+        prob_result = self._build_subtype_prob_overlay(
             preds, thumb_arr, scale_x, scale_y, patch_size
         )
-        if seg_result is not None:
+        if prob_result is not None:
+            overlay_rgb, subtype_class = prob_result
+            mode = "prob"
+            panel2_title = f"{subtype_class} probability"
+        elif (seg_result := self._build_segmentation_overlay(
+                preds, thumb_arr, scale_x, scale_y, patch_size)) is not None:
             overlay_rgb, seg_area = seg_result
             mode = "seg"
             panel2_title = "Predicted subtype regions"
+        elif (attn_result := self._build_attention_overlay(
+                preds, thumb_arr, scale_x, scale_y, patch_size)) is not None:
+            overlay_rgb, subtype_class = attn_result
+            mode = "attn"
+            panel2_title = f"Attention ({subtype_class})"
         else:
-            attn_result = self._build_attention_overlay(
-                preds, thumb_arr, scale_x, scale_y, patch_size
-            )
-            if attn_result is not None:
-                overlay_rgb, attn_class = attn_result
-                mode = "attn"
-                panel2_title = f"Attention ({attn_class})"
-            else:
-                prob_maps = self._build_prob_maps(preds, thumb_w, thumb_h, scale_x, scale_y, patch_size)
-                overlay_rgb = self._blend_overlay(thumb_arr, prob_maps)
-                mode = "class"
-                panel2_title = "Spatial Prediction"
+            prob_maps = self._build_prob_maps(preds, thumb_w, thumb_h, scale_x, scale_y, patch_size)
+            overlay_rgb = self._blend_overlay(thumb_arr, prob_maps)
+            mode = "class"
+            panel2_title = "Spatial Prediction"
 
         gt_overlay_rgb: np.ndarray | None = None
         if show_gt and gt_df is not None:
@@ -270,8 +273,10 @@ class HeatmapGenerator:
             if "bag_pred_class" in preds.columns and len(preds)
             else pred_name
         )
-        if mode == "attn":
-            title = f"{slide_id}  |  Attention heatmap — predicted {attn_class} ({wsi_conf * 100:.1f}%)"
+        if mode == "prob":
+            title = f"{slide_id}  |  Predicted: {subtype_class} — spatial probability"
+        elif mode == "attn":
+            title = f"{slide_id}  |  Attention heatmap — predicted {subtype_class} ({wsi_conf * 100:.1f}%)"
         elif mode == "seg":
             title = f"{slide_id}  |  Predicted subtype: {wsi_disp}"
         else:
@@ -279,17 +284,20 @@ class HeatmapGenerator:
         fig.suptitle(title, fontsize=13, fontweight="bold", y=0.98)
 
         # Bottom legend
-        if mode == "attn":
+        if mode in ("prob", "attn"):
             import matplotlib.cm as cm
             cmap = cm.get_cmap("jet")
             legend_handles = [
                 mpatches.Patch(color=cmap(v), label=lab)
                 for v, lab in [(0.05, "low"), (0.5, "medium"), (0.95, "high")]
             ]
+            leg_title = (
+                f"P({subtype_class}) — low → high"
+                if mode == "prob" else "Attention (for predicted subtype)"
+            )
             fig.legend(
                 handles=legend_handles, loc="lower center", ncol=3, fontsize=10,
-                framealpha=0.9, bbox_to_anchor=(0.5, 0.005),
-                title="Attention (for predicted subtype)",
+                framealpha=0.9, bbox_to_anchor=(0.5, 0.005), title=leg_title,
             )
         else:
             # per-class color + name; show foreground-area % (seg) or mean conf (class)
@@ -585,6 +593,83 @@ class HeatmapGenerator:
         blended = thumb_f * (1.0 - eff_alpha) + color_layer * eff_alpha
         blended = np.clip(blended * 255.0, 0, 255).astype(np.uint8)
         return blended
+
+    def _build_subtype_prob_overlay(
+        self,
+        preds: pd.DataFrame,
+        thumbnail: np.ndarray,
+        scale_x: float,
+        scale_y: float,
+        patch_size: int,
+    ):
+        """Single-subtype spatial-probability heatmap (consistent across slides).
+
+        For a slide predicted (at WSI level) as subtype *S*, colors the tissue by
+        the per-patch probability of *S* using a fixed ``jet`` scale — so every
+        heatmap reads the same way (red = strong evidence for the subtype named
+        in the title), regardless of which subtype it is. Background/normal
+        patches (``is_background == 1``) are not colored. Returns
+        ``(overlay_rgb, class_name)`` or ``None`` when the needed columns are
+        absent.
+        """
+        if "bag_pred_class" not in preds.columns or len(preds) == 0:
+            return None
+        cls_name = str(preds["bag_pred_class"].iloc[0])
+        prob_col = f"prob_{cls_name}"
+        if prob_col not in preds.columns:
+            return None
+
+        import matplotlib.cm as cm
+
+        thumb_h, thumb_w = thumbnail.shape[:2]
+        ps_x = max(1, int(patch_size * scale_x))
+        ps_y = max(1, int(patch_size * scale_y))
+        xs = (preds["x"].values * scale_x).astype(np.int32)
+        ys = (preds["y"].values * scale_y).astype(np.int32)
+        vals = pd.to_numeric(preds[prob_col], errors="coerce").fillna(0.0).values.astype(np.float32)
+        # Restrict the map to foreground (tumor) patches so normal tissue and the
+        # background dilution do not wash out the signal.
+        if "is_background" in preds.columns:
+            fg = pd.to_numeric(preds["is_background"], errors="coerce").fillna(0).values.astype(int) == 0
+        else:
+            fg = np.ones(len(preds), dtype=bool)
+
+        acc = np.zeros((thumb_h, thumb_w), dtype=np.float32)
+        cnt = np.zeros((thumb_h, thumb_w), dtype=np.float32)
+        for i in range(len(preds)):
+            if not fg[i]:
+                continue
+            x0, y0 = int(xs[i]), int(ys[i])
+            x1, y1 = min(thumb_w, x0 + ps_x), min(thumb_h, y0 + ps_y)
+            if x0 >= thumb_w or y0 >= thumb_h or x1 <= 0 or y1 <= 0:
+                continue
+            acc[y0:y1, x0:x1] += vals[i]
+            cnt[y0:y1, x0:x1] += 1.0
+        fgmask = cnt > 0
+        if not fgmask.any():
+            return None
+
+        # Local mean prob among foreground patches (coverage = foreground density).
+        sigma = max(self.gaussian_sigma, ps_x * 1.2, ps_y * 1.2)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            val0 = np.where(fgmask, acc / np.maximum(cnt, 1.0), 0.0)
+            val_s = gaussian_filter(val0, sigma=sigma)
+            cov_s = gaussian_filter(fgmask.astype(np.float32), sigma=sigma)
+            field = np.where(cov_s > 1e-3, val_s / np.maximum(cov_s, 1e-3), 0.0)
+
+        # Fixed absolute scale so a given color means the same probability on
+        # every slide (P=0.5 → full red).
+        norm = np.clip(field / 0.5, 0.0, 1.0)
+        fg_w = np.clip((cov_s - 0.2) / 0.3, 0.0, 1.0)        # confine to foreground
+
+        colored = cm.get_cmap("jet")(norm)[:, :, :3].astype(np.float32)
+        thumb_f = thumbnail.astype(np.float32) / 255.0
+        # Alpha gates on probability (low → transparent, so no blue haze) AND on
+        # foreground coverage.
+        alpha = ((norm ** 1.8) * fg_w * 0.95)[:, :, None]
+        blended = thumb_f * (1.0 - alpha) + colored * alpha
+        overlay_rgb = np.clip(blended * 255.0, 0, 255).astype(np.uint8)
+        return overlay_rgb, cls_name
 
     def _build_segmentation_overlay(
         self,
